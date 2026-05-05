@@ -13,7 +13,8 @@
 # 6. Kaniko-specific tests
 # =============================================================================
 
-FROM node:22-slim AS penetration-tester
+# Single-stage build for Kaniko compatibility
+FROM node:22-slim
 
 # Install tools needed for penetration testing
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -70,11 +71,9 @@ RUN echo "=== BUILD TEST 4: Docker Socket ===" && \
 # Test 5: Network access during build
 RUN echo "=== BUILD TEST 5: Network Access ===" && \
     echo "Testing network connectivity..." > /build-test-results/05-network.txt && \
-    # Try to reach common internal services
     timeout 2 curl -s http://172.17.0.1:3000 >> /build-test-results/05-network.txt 2>&1 || echo "172.17.0.1:3000 - blocked or timeout" >> /build-test-results/05-network.txt; \
     timeout 2 curl -s http://172.30.0.1:3000 >> /build-test-results/05-network.txt 2>&1 || echo "172.30.0.1:3000 - blocked or timeout" >> /build-test-results/05-network.txt; \
     timeout 2 curl -s http://10.0.0.1:3000 >> /build-test-results/05-network.txt 2>&1 || echo "10.0.0.1:3000 - blocked or timeout" >> /build-test-results/05-network.txt; \
-    # Try to reach internet
     timeout 5 curl -s https://google.com >> /build-test-results/05-network.txt 2>&1 && echo "Internet accessible" >> /build-test-results/05-network.txt || echo "Internet blocked" >> /build-test-results/05-network.txt
 
 # Test 6: DNS resolution during build
@@ -149,13 +148,13 @@ RUN echo "=== BUILD PENETRATION TEST SUMMARY ===" > /build-test-results/SUMMARY.
     cat /build-test-results/09-build-env.txt >> /build-test-results/SUMMARY.txt 2>&1 || true
 
 # =============================================================================
-# FINAL STAGE - Copy test results and add runtime test script
+# FINAL SETUP
 # =============================================================================
 
 WORKDIR /app
 
 # Copy build test results
-COPY --from=penetration-tester /build-test-results ./build-test-results
+RUN cp -r /build-test-results ./build-test-results
 
 # Copy the runtime penetration test script
 COPY main.js .

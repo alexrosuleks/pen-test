@@ -1,0 +1,10 @@
+{
+  "name": "penetration-tester",
+  "version": "1.0.0",
+  "description": "Security penetration tester for Scrapely containers - tests network isolation, gVisor sandbox, container breakout, and more",
+  "entrypoint": "main.js",
+  "maxMemory": 512,
+  "maxTimeout": 300,
+  "actorRuns": 1000,
+  "buildTag": "latest"
+}

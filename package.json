@@ -1,0 +1,17 @@
+{
+  "name": "penetration-tester",
+  "version": "1.0.0",
+  "description": "Security penetration tester for Scrapely containers",
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js",
+    "test": "node main.js"
+  },
+  "keywords": ["security", "penetration-testing", "container", "gvisor", "docker"],
+  "author": "Scrapely Security Team",
+  "license": "MIT",
+  "dependencies": {
+    "scrapely": "latest"
+  }
+}

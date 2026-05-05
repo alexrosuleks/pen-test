@@ -21,6 +21,7 @@ import { Buffer } from 'buffer';
 const results = {
     timestamp: new Date().toISOString(),
     categories: {
+        buildTime: { tests: [], passed: 0, failed: 0 },
         networkIsolation: { tests: [], passed: 0, failed: 0 },
         gvisorEscape: { tests: [], passed: 0, failed: 0 },
         containerBreakout: { tests: [], passed: 0, failed: 0 },
@@ -621,6 +622,77 @@ async function testInfoDisclosure() {
 }
 
 // ========================================
+// 0. BUILD-TIME TEST RESULTS
+// ========================================
+console.log('\n=== 0. BUILD-TIME TEST RESULTS ===\n');
+
+async function testBuildTime() {
+    // Check if build test results exist (from Dockerfile)
+    const buildResultsPath = '/app/build-test-results/SUMMARY.txt';
+    
+    if (fs.existsSync(buildResultsPath)) {
+        console.log('Build-time test results found!');
+        const summary = fs.readFileSync(buildResultsPath, 'utf8');
+        console.log(summary);
+        
+        // Parse the results and add to our test results
+        const resultsDir = '/app/build-test-results';
+        
+        // Check each test file
+        const testFiles = [
+            { file: '01-user-context.txt', name: 'Build User Context' },
+            { file: '02-sensitive-env.txt', name: 'Build Env Vars Secure' },
+            { file: '03-host-fs.txt', name: 'Build Host FS Isolated' },
+            { file: '04-docker-socket.txt', name: 'Build Docker Socket Blocked' },
+            { file: '05-network.txt', name: 'Build Network Isolated' },
+            { file: '06-dns.txt', name: 'Build DNS Secure' },
+            { file: '07-processes.txt', name: 'Build Process Isolation' },
+            { file: '08-capabilities.txt', name: 'Build Capabilities Limited' },
+            { file: '09-build-env.txt', name: 'Build Environment Detected' },
+            { file: '10-secrets.txt', name: 'Build Secrets Protected' },
+            { file: '11-mounts.txt', name: 'Build Mounts Safe' },
+            { file: '12-gvisor.txt', name: 'Build gVisor Status' }
+        ];
+        
+        for (const { file, name } of testFiles) {
+            const filePath = `${resultsDir}/${file}`;
+            if (fs.existsSync(filePath)) {
+                const content = fs.readFileSync(filePath, 'utf8');
+                const hasVulnerability = content.toLowerCase().includes('critical') || 
+                                        content.toLowerCase().includes('accessible') ||
+                                        (content.toLowerCase().includes('exists') && 
+                                         (name.includes('Docker Socket') || name.includes('Secrets')));
+                
+                logTest('buildTime', name, !hasVulnerability, {
+                    file,
+                    preview: content.substring(0, 200)
+                });
+            }
+        }
+        
+        results.buildTime = { summary, resultsPath };
+    } else {
+        console.log('No build-time test results found (built without custom Dockerfile)');
+        logTest('buildTime', 'Build-Time Tests Available', false, {
+            note: 'Actor was not built with penetration test Dockerfile'
+        });
+    }
+    
+    // Also check for build test results in other possible locations
+    const altPaths = [
+        '/build-test-results/SUMMARY.txt',
+        './build-test-results/SUMMARY.txt',
+        '/tmp/build-test-results/SUMMARY.txt'
+    ];
+    
+    for (const altPath of altPaths) {
+        if (fs.existsSync(altPath)) {
+            console.log(`\nAlternative build results found at: ${altPath}`);
+        }
+    }
+}
+
+// ========================================
 // Main Execution
 // ========================================
 async function main() {
@@ -632,6 +704,7 @@ async function main() {
     console.log(`Container ID: ${runCmd('hostname').output.trim()}`);
 
     try {
+        await testBuildTime();
         await testNetworkIsolation();
         await testGvisorEscape();
         await testContainerBreakout();

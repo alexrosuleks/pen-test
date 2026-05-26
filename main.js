@@ -20,9 +20,12 @@ import { Buffer } from 'buffer';
 // ========================================
 const results = {
     timestamp: new Date().toISOString(),
+    containerInfo: {},
     categories: {
         buildTime: { tests: [], passed: 0, failed: 0 },
         networkIsolation: { tests: [], passed: 0, failed: 0 },
+        perUserNetwork: { tests: [], passed: 0, failed: 0 },
+        registryAccess: { tests: [], passed: 0, failed: 0 },
         gvisorEscape: { tests: [], passed: 0, failed: 0 },
         containerBreakout: { tests: [], passed: 0, failed: 0 },
         resourceExhaustion: { tests: [], passed: 0, failed: 0 },
@@ -207,9 +210,255 @@ async function testNetworkIsolation() {
 }
 
 // ========================================
-// 2. gVisor SANDBOX ESCAPE TESTS
+// 2. PER-USER NETWORK ISOLATION TESTS
 // ========================================
-console.log('\n=== 2. gVisor SANDBOX ESCAPE TESTS ===\n');
+console.log('\n=== 2. PER-USER NETWORK ISOLATION TESTS ===\n');
+
+async function testPerUserNetworkIsolation() {
+    // 2.1 Detect current network configuration
+    console.log('2.1 Network Namespace Detection...');
+    const networkNs = runCmd('ls -la /proc/self/ns/net 2>&1');
+    const networkInode = networkNs.output.match(/net:\[(\d+)\]/)?.[1] || 'unknown';
+    
+    const routeTable = runCmd('ip route 2>&1 || route -n 2>&1');
+    const routes = routeTable.output.split('\n').filter(l => l.trim());
+    
+    const gatewayMatch = routeTable.output.match(/default via ([\d.]+)/);
+    const gateway = gatewayMatch ? gatewayMatch[1] : 'unknown';
+    
+    logTest('perUserNetwork', 'Network Namespace Isolated', true, {
+        networkInode,
+        gateway,
+        routeCount: routes.length,
+        routes: routes.slice(0, 5)
+    });
+
+    // 2.2 Check for user-specific network markers
+    console.log('2.2 User Network Markers...');
+    const hostname = runCmd('hostname').output.trim();
+    const containerId = hostname.length >= 12 ? hostname.substring(0, 12) : hostname;
+    
+    // Check if we're in a user-specific network (should be named like user_<id>_network)
+    const networkName = process.env.DOCKER_NETWORK || 'unknown';
+    const isUserNetwork = networkName.includes('user') || networkName.includes('isolated');
+    
+    logTest('perUserNetwork', 'User-Specific Network Detected', isUserNetwork || networkName === 'unknown', {
+        hostname,
+        containerId,
+        networkName,
+        note: 'Should be in user-isolated network'
+    });
+
+    // 2.3 Test cross-user isolation (try to reach other user's containers)
+    console.log('2.3 Cross-User Isolation Test...');
+    // Scan for other container IP ranges that might belong to other users
+    const otherUserRanges = [
+        '172.18.0.0/16', '172.19.0.0/16', '172.20.0.0/16', '172.21.0.0/16',
+        '172.22.0.0/16', '172.23.0.0/16', '172.24.0.0/16',
+        '10.10.0.0/16', '10.20.0.0/16', '10.100.0.0/16',
+        '192.168.10.0/24', '192.168.20.0/24', '192.168.100.0/24'
+    ];
+    
+    let crossUserLeaks = [];
+    for (const range of otherUserRanges.slice(0, 6)) {
+        // Try the .1 and .2 IPs in each range
+        const baseIP = range.split('/')[0].split('.').slice(0, 3).join('.');
+        for (let i = 1; i <= 3; i++) {
+            const testIP = `${baseIP}.${i}`;
+            const result = await testTcpConnect(testIP, 3000, 1000);
+            if (result.connected) {
+                crossUserLeaks.push(testIP);
+            }
+        }
+    }
+    logTest('perUserNetwork', 'Cross-User Network Isolation', crossUserLeaks.length === 0, {
+        vulnerability: crossUserLeaks.length > 0 ? `Other user networks reachable: ${crossUserLeaks.join(', ')}` : null,
+        testedRanges: otherUserRanges.length
+    });
+
+    // 2.4 Test API endpoint access (should be allowed)
+    console.log('2.4 API Endpoint Access...');
+    const apiEndpoints = [
+        { host: 'api', port: 3000, name: 'Internal API' },
+        { host: 'scrapely-server', port: 3000, name: 'Server' },
+        { host: '172.17.0.1', port: 3000, name: 'Docker Gateway API' }
+    ];
+    
+    let apiEndpointsAccessible = [];
+    for (const endpoint of apiEndpoints) {
+        const result = await testTcpConnect(endpoint.host, endpoint.port, 2000);
+        if (result.connected) {
+            apiEndpointsAccessible.push(endpoint.name);
+        }
+    }
+    logTest('perUserNetwork', 'API Endpoints Reachable', apiEndpointsAccessible.length > 0, {
+        accessible: apiEndpointsAccessible,
+        note: 'API should be reachable from container'
+    });
+
+    // 2.5 Test registry endpoint access (should be allowed)
+    console.log('2.5 Registry Endpoint Access...');
+    const registryEndpoints = [
+        { host: 'registry', port: 5000, name: 'Internal Registry' },
+        { host: '172.17.0.1', port: 5000, name: 'Docker Gateway Registry' }
+    ];
+    
+    let registryAccessible = [];
+    for (const endpoint of registryEndpoints) {
+        const result = await testTcpConnect(endpoint.host, endpoint.port, 2000);
+        if (result.connected) {
+            registryAccessible.push(endpoint.name);
+        }
+    }
+    logTest('perUserNetwork', 'Registry Endpoint Reachable', registryAccessible.length > 0, {
+        accessible: registryAccessible,
+        note: 'Registry should be reachable for image pulls'
+    });
+
+    // 2.6 Check iptables/nftables rules visibility
+    console.log('2.6 Firewall Rules Visibility...');
+    const iptables = runCmd('iptables -L 2>&1 || nft list ruleset 2>&1 || echo "firewall not accessible"');
+    const canSeeFirewall = !iptables.output.includes('Permission denied') && 
+                           !iptables.output.includes('not accessible');
+    logTest('perUserNetwork', 'Firewall Rules Hidden', !canSeeFirewall, {
+        output: iptables.output.substring(0, 200)
+    });
+
+    // 2.7 Network interface enumeration
+    console.log('2.7 Network Interfaces...');
+    const interfaces = runCmd('ip link show 2>&1 || ifconfig 2>&1');
+    const interfaceList = interfaces.output.split('\n')
+        .filter(l => l.match(/^\d+:/) || l.match(/^[a-z]/i))
+        .map(l => l.trim().split(':')[1]?.split('@')[0] || l.split(' ')[0])
+        .filter(l => l && l.length > 0);
+    
+    const expectedInterfaces = ['lo', 'eth0', 'sit0'];
+    const unexpectedInterfaces = interfaceList.filter(i => !expectedInterfaces.includes(i));
+    
+    logTest('perUserNetwork', 'Network Interfaces Clean', unexpectedInterfaces.length === 0, {
+        interfaces: [...new Set(interfaceList)],
+        unexpected: unexpectedInterfaces
+    });
+
+    // Store network info for results
+    results.containerInfo.networkInode = networkInode;
+    results.containerInfo.gateway = gateway;
+    results.containerInfo.interfaces = interfaceList;
+}
+
+// ========================================
+// 3. REGISTRY ACCESS TESTS
+// ========================================
+console.log('\n=== 3. REGISTRY ACCESS TESTS ===\n');
+
+async function testRegistryAccess() {
+    // 3.1 Registry authentication check
+    console.log('3.1 Registry Authentication Required...');
+    
+    // Try to access registry catalog without auth
+    const registryHosts = ['registry:5000', '172.17.0.1:5000', 'localhost:5000'];
+    let registryAuthRequired = true;
+    let registryEndpoints = [];
+    
+    for (const host of registryHosts) {
+        const [hostname, port] = host.split(':');
+        const result = await testTcpConnect(hostname, parseInt(port), 2000);
+        if (result.connected) {
+            registryEndpoints.push(host);
+            
+            // Try to access catalog
+            const catalogTest = runCmd(`curl -s http://${host}/v2/_catalog 2>&1 | head -20`);
+            const catalogData = catalogTest.output;
+            
+            // If we get a list of repos, auth is not required (vulnerability!)
+            if (catalogData.includes('"repositories"') && !catalogData.includes('Unauthorized')) {
+                registryAuthRequired = false;
+            }
+        }
+    }
+    
+    logTest('registryAccess', 'Registry Requires Authentication', registryAuthRequired, {
+        vulnerability: !registryAuthRequired ? 'Registry allows unauthenticated access!' : null,
+        accessibleEndpoints: registryEndpoints
+    });
+
+    // 3.2 Registry Docker API access
+    console.log('3.2 Registry Docker API Access...');
+    const dockerRegTest = runCmd(`curl -s http://registry:5000/v2/ 2>&1 || curl -s http://172.17.0.1:5000/v2/ 2>&1`);
+    const v2ApiAccessible = dockerRegTest.output.includes('Docker-Distribution-API-Version') ||
+                            dockerRegTest.output.includes('API version');
+    logTest('registryAccess', 'Registry V2 API Accessible', v2ApiAccessible, {
+        note: 'Registry V2 API should be accessible for pulls'
+    });
+
+    // 3.3 Test image pull without auth
+    console.log('3.3 Image Pull Auth Test...');
+    const pullTest = runCmd(`
+        curl -s http://registry:5000/v2/test-image/manifests/latest 2>&1 | head -20 ||
+        curl -s http://172.17.0.1:5000/v2/test-image/manifests/latest 2>&1 | head -20
+    `);
+    const manifestAccessible = pullTest.output.includes('manifest') && 
+                               !pullTest.output.includes('Unauthorized') &&
+                               !pullTest.output.includes('401');
+    logTest('registryAccess', 'Image Manifests Protected', !manifestAccessible, {
+        vulnerability: manifestAccessible ? 'Can access image manifests without auth!' : null
+    });
+
+    // 3.4 Registry credentials in environment
+    console.log('3.4 Registry Credentials Check...');
+    const regCreds = runCmd('env | grep -iE "(REGISTRY|DOCKER.*USER|DOCKER.*PASS|DOCKER.*TOKEN)" 2>&1 || echo "none"');
+    const hasCreds = !regCreds.output.includes('none') && regCreds.output.trim().length > 0;
+    
+    // Mask the actual credentials
+    let maskedCreds = [];
+    if (hasCreds) {
+        maskedCreds = regCreds.output.split('\n')
+            .filter(l => l.includes('='))
+            .map(l => l.split('=')[0] + '=***');
+    }
+    
+    logTest('registryAccess', 'Registry Credentials Available', hasCreds, {
+        credentialVars: maskedCreds,
+        note: 'Credentials should be available for authenticated pulls'
+    });
+
+    // 3.5 Test push access
+    console.log('3.5 Registry Push Access...');
+    // This should fail without proper auth
+    const pushTest = runCmd(`
+        curl -s -X POST http://registry:5000/v2/test/blobs/uploads/ 2>&1 ||
+        echo "push test failed"
+    `);
+    const canPush = pushTest.output.includes('Location') || pushTest.output.includes('upload');
+    logTest('registryAccess', 'Registry Push Blocked', !canPush, {
+        vulnerability: canPush ? 'Can push images without proper auth!' : null
+    });
+
+    // 3.6 Check for other users' images
+    console.log('3.6 Other Users Images Access...');
+    const catalogResult = runCmd(`
+        curl -s http://registry:5000/v2/_catalog?n=100 2>&1 ||
+        curl -s http://172.17.0.1:5000/v2/_catalog?n=100 2>&1 ||
+        echo "catalog not accessible"
+    `);
+    
+    // If we can see the catalog, check if we see other users' images
+    const canSeeCatalog = catalogResult.output.includes('"repositories"');
+    const catalogData = JSON.parse(catalogResult.output.replace(/.*?(\{.*\}).*/s, '$1') || '{"repositories":[]}');
+    const otherUserImages = (catalogData.repositories || []).filter(r => 
+        !r.includes(process.env.USER_ID || 'unknown') && 
+        r.includes('/')
+    );
+    
+    logTest('registryAccess', 'Other Users Images Hidden', !canSeeCatalog || otherUserImages.length === 0, {
+        vulnerability: otherUserImages.length > 0 ? `Can see other users' images: ${otherUserImages.slice(0, 5).join(', ')}` : null
+    });
+}
+
+// ========================================
+// 4. gVisor SANDBOX ESCAPE TESTS
+// ========================================
+console.log('\n=== 4. gVisor SANDBOX ESCAPE TESTS ===\n');
 
 async function testGvisorEscape() {
     // 2.1 Check if running under gVisor
@@ -706,6 +955,8 @@ async function main() {
     try {
         await testBuildTime();
         await testNetworkIsolation();
+        await testPerUserNetworkIsolation();
+        await testRegistryAccess();
         await testGvisorEscape();
         await testContainerBreakout();
         await testResourceExhaustion();

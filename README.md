@@ -1,8 +1,19 @@
-# Scrapely Container Penetration Tester
+# Scrapely Container Penetration Tester (v2)
 
 A comprehensive security testing actor that validates container isolation, network security, and access controls in the Scrapely platform.
 
 ## What It Tests
+
+### 0. Container Hardening (runtime)
+- `CapEff` zero (`CapDrop: ALL` on run containers)
+- `NoNewPrivs=1` (`no-new-privileges`)
+- Not privileged / no privileged mounts
+
+### 0b. Scrapely platform env
+- Forbidden secrets absent (`ADMIN_API_KEY`, `SINGLESTORE_*`, `REGISTRY_PASSWORD`, etc.)
+- Expected run env present (`SCRAPELY_TOKEN`, `SCRAPELY_API_URL`, `CDP_URL`, …)
+- `SCRAPELY_API_URL` reachable
+- No `DOCKER_HOST` in container
 
 ### 1. Build-Time Security Tests
 Tests performed during Docker image build:
@@ -21,20 +32,17 @@ Tests performed during Docker image build:
 
 ### 2. Network Isolation Tests
 - IPv6 bypass attempts
-- Internal IP reachability (10.x, 172.x, 192.168.x)
-- UDP port scanning
-- Database port access (MySQL, PostgreSQL, Redis, MongoDB, etc.)
-- DNS resolution (internal and external)
-- Internal hostname enumeration
+- Internal IP + **database ports** blocked (not mis-flagging API :3000)
+- Cloud metadata `169.254.169.254` blocked
+- SSH to docker gateway blocked
+- `resolv.conf` public DNS (gVisor)
+- Compose service name DNS should not resolve
+- Internet egress available
 
 ### 3. Per-User Network Isolation Tests
-- Network namespace detection
-- User-specific network markers
-- Cross-user isolation (scanning other user networks)
-- API endpoint accessibility (should be allowed)
-- Registry endpoint accessibility (should be allowed)
-- Firewall rules visibility
-- Network interface enumeration
+- Container IP in `172.32–47.x` user subnets
+- Cross-user gateway scan (`172.32.0.1` … `172.47.0.1` on DB ports)
+- Host firewall rules not visible from container
 
 ### 4. Registry Access Tests
 - Registry authentication requirements
@@ -74,14 +82,9 @@ Tests performed during Docker image build:
 - OOM killer configuration
 
 ### 8. Information Disclosure Tests
-- Environment variable scanning
-- /etc/passwd access
-- /etc/shadow access
-- Network configuration exposure
-- Container config files
-- Running process enumeration
-- Scrapely-specific secret files
-- Manifest file access
+- Platform secrets must not appear in env (user `SCRAPELY_TOKEN` is expected)
+- No host daemon processes visible
+- No readable `/kaniko/.docker/config.json` or platform `.env` files
 
 ## Usage
 

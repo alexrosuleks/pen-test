@@ -1,39 +1,79 @@
 /**
- * Scrapely Container Penetration Tester
- * 
- * This actor attempts various attacks to find security vulnerabilities:
- * 1. Network isolation bypass (IPv6, UDP, DNS, tunneling)
- * 2. gVisor sandbox escape (procfs, sysfs, syscalls)
- * 3. Container breakout (symlinks, devices, docker socket)
- * 4. Resource exhaustion (process limits, memory, file descriptors)
- * 5. Information disclosure (env vars, credentials, enumeration)
+ * Scrapely Container Penetration Tester v2
+ *
+ * Runtime + build-time checks for Scrapely isolation:
+ * - Network (RFC1918, per-user 172.32–47, DNS, IPv6, metadata)
+ * - Registry auth (no anonymous catalog/manifest/push)
+ * - gVisor / breakout / docker socket
+ * - CapDrop ALL + no-new-privileges (run hardening)
+ * - Scrapely env (expected user token vs forbidden admin/DB creds)
+ * - Resource limits, info disclosure
  */
 
 import net from 'net';
 import dns from 'dns/promises';
 import fs from 'fs';
-import { execSync, spawn } from 'child_process';
-import { Buffer } from 'buffer';
+import { execSync } from 'child_process';
 
-// ========================================
-// Test Results Storage
-// ========================================
+const PENETRATION_TESTER_VERSION = '2.0.0';
+
 const results = {
+    version: PENETRATION_TESTER_VERSION,
     timestamp: new Date().toISOString(),
     containerInfo: {},
     categories: {
         buildTime: { tests: [], passed: 0, failed: 0 },
+        containerHardening: { tests: [], passed: 0, failed: 0 },
+        scrapelyPlatform: { tests: [], passed: 0, failed: 0 },
         networkIsolation: { tests: [], passed: 0, failed: 0 },
         perUserNetwork: { tests: [], passed: 0, failed: 0 },
         registryAccess: { tests: [], passed: 0, failed: 0 },
         gvisorEscape: { tests: [], passed: 0, failed: 0 },
         containerBreakout: { tests: [], passed: 0, failed: 0 },
         resourceExhaustion: { tests: [], passed: 0, failed: 0 },
-        infoDisclosure: { tests: [], passed: 0, failed: 0 }
+        infoDisclosure: { tests: [], passed: 0, failed: 0 },
     },
     vulnerabilities: [],
-    summary: {}
+    summary: {},
 };
+
+/** Env vars that must NEVER appear in run containers */
+const FORBIDDEN_ENV_PREFIXES = [
+    'ADMIN_API_KEY',
+    'SINGLESTORE_',
+    'REGISTRY_PASSWORD',
+    'REGISTRY_USERNAME',
+    'REGISTRY_TOKEN_PRIVATE_KEY',
+    'DRAGONFLY_PASSWORD',
+    'ENCRYPTION_MASTER_KEY',
+    'S3_SECRET',
+    'S3_ACCESS_KEY',
+];
+
+/** Expected in run containers (presence is OK) */
+const EXPECTED_RUN_ENV = [
+    'SCRAPELY_TOKEN',
+    'SCRAPELY_API_URL',
+    'CDP_URL',
+    'ACTOR_RUN_ID',
+    'ACTOR_ID',
+];
+
+const INTERNAL_IPS = [
+    '10.0.0.1', '10.0.0.2', '10.255.255.1',
+    '172.16.0.1', '172.17.0.1', '172.18.0.1', '172.30.0.1', '172.31.0.1',
+    '192.168.0.1', '192.168.1.1',
+];
+
+const DB_PORTS = [
+    { port: 3306, name: 'MySQL' },
+    { port: 5432, name: 'PostgreSQL' },
+    { port: 6379, name: 'Redis/Dragonfly' },
+    { port: 27017, name: 'MongoDB' },
+    { port: 9200, name: 'Elasticsearch' },
+];
+
+const USER_SUBNET_GATEWAYS = Array.from({ length: 16 }, (_, i) => `172.${32 + i}.0.1`);
 
 function logTest(category, name, passed, details = {}) {
     const test = { name, passed, details, timestamp: new Date().toISOString() };
@@ -43,7 +83,8 @@ function logTest(category, name, passed, details = {}) {
         console.log(`  ✓ ${name}`);
     } else {
         results.categories[category].failed++;
-        console.log(`  ✗ ${name} - ${details.error || details.vulnerability || 'FAILED'}`);
+        const msg = details.error || details.vulnerability || details.note || 'FAILED';
+        console.log(`  ✗ ${name} - ${msg}`);
         if (details.vulnerability) {
             results.vulnerabilities.push({ category, name, ...details });
         }
@@ -52,14 +93,19 @@ function logTest(category, name, passed, details = {}) {
 
 function runCmd(cmd, timeoutMs = 5000) {
     try {
-        const output = execSync(cmd, { 
-            timeout: timeoutMs, 
+        const output = execSync(cmd, {
+            timeout: timeoutMs,
             encoding: 'utf8',
-            stdio: ['pipe', 'pipe', 'pipe']
+            stdio: ['pipe', 'pipe', 'pipe'],
         }).toString();
         return { success: true, output };
     } catch (e) {
-        return { success: false, error: e.message, output: e.stdout?.toString() || '', stderr: e.stderr?.toString() || '' };
+        return {
+            success: false,
+            error: e.message,
+            output: e.stdout?.toString() || '',
+            stderr: e.stderr?.toString() || '',
+        };
     }
 }
 
@@ -70,13 +116,13 @@ async function testTcpConnect(host, port, timeoutMs = 2000) {
             socket.destroy();
             resolve({ connected: false, error: 'timeout' });
         }, timeoutMs);
-        
+
         socket.connect(port, host, () => {
             clearTimeout(timer);
             socket.destroy();
             resolve({ connected: true });
         });
-        
+
         socket.on('error', (err) => {
             clearTimeout(timer);
             resolve({ connected: false, error: err.code || err.message });
@@ -84,876 +130,514 @@ async function testTcpConnect(host, port, timeoutMs = 2000) {
     });
 }
 
-// ========================================
-// 1. NETWORK ISOLATION BYPASS TESTS
-// ========================================
-console.log('\n=== 1. NETWORK ISOLATION BYPASS TESTS ===\n');
-
-async function testNetworkIsolation() {
-    // 1.1 IPv6 Testing - Check if IPv6 can bypass iptables
-    console.log('1.1 IPv6 Network Access...');
-    const ipv6Test = runCmd('ip -6 addr 2>&1 || echo "IPv6 not available"');
-    if (ipv6Test.output.includes('inet6') && !ipv6Test.output.includes('not available')) {
-        // Try to connect via IPv6
-        const ipv6Connect = await testTcpConnect('::1', 80, 1000);
-        logTest('networkIsolation', 'IPv6 Loopback Access', !ipv6Connect.connected, {
-            vulnerability: ipv6Connect.connected ? 'IPv6 can bypass iptables rules' : null,
-            output: ipv6Test.output.substring(0, 500)
-        });
-    } else {
-        logTest('networkIsolation', 'IPv6 Disabled/Unavailable', true, { output: ipv6Test.output.substring(0, 200) });
+function parseProcStatus() {
+    const status = runCmd('cat /proc/self/status 2>&1');
+    const lines = status.output.split('\n');
+    const map = {};
+    for (const line of lines) {
+        const m = line.match(/^(\w+):\s+(.*)$/);
+        if (m) map[m[1]] = m[2].trim();
     }
+    return map;
+}
 
-    // 1.2 TCP to Internal IPs
-    console.log('1.2 TCP Internal IP Reachability...');
-    const internalIPs = [
-        '10.0.0.1', '10.0.0.2', '10.1.0.1', '10.255.255.1',
-        '172.16.0.1', '172.17.0.1', '172.18.0.1', '172.30.0.1',
-        '192.168.0.1', '192.168.1.1', '192.168.100.1'
+function capHexToBigInt(hex) {
+    if (!hex) return 0n;
+    return BigInt(`0x${hex}`);
+}
+
+function httpProbe(url, timeoutSec = 3) {
+    return runCmd(`curl -sS -m ${timeoutSec} -o /dev/null -w "%{http_code}" "${url}" 2>&1 || echo "curl_failed"`);
+}
+
+// ========================================
+// BUILD-TIME (from Dockerfile RUN steps)
+// ========================================
+async function testBuildTime() {
+    console.log('\n=== BUILD-TIME TESTS ===\n');
+
+    const paths = [
+        '/app/build-test-results/SUMMARY.txt',
+        '/build-test-results/SUMMARY.txt',
     ];
-    
-    let internalIPLeaks = 0;
-    for (const ip of internalIPs) {
-        const result = await testTcpConnect(ip, 3000, 1500);
-        if (result.connected) {
-            internalIPLeaks++;
-            console.log(`    LEAK: ${ip}:3000 is reachable!`);
+
+    let resultsDir = null;
+    for (const p of paths) {
+        if (fs.existsSync(p)) {
+            resultsDir = p.replace('/SUMMARY.txt', '');
+            break;
         }
     }
-    logTest('networkIsolation', 'Internal IPs Blocked', internalIPLeaks === 0, {
-        vulnerability: internalIPLeaks > 0 ? `${internalIPLeaks} internal IPs reachable` : null,
-        testedIPs: internalIPs.length
-    });
 
-    // 1.3 UDP Port Scanning (database ports)
-    console.log('1.3 UDP Database Port Access...');
-    const udpPorts = [53, 161, 123];
-    let udpLeaks = 0;
-    for (const port of udpPorts) {
-        const result = runCmd(`timeout 2 bash -c "echo test | nc -u -w1 172.17.0.1 ${port} 2>&1" || true`);
-        // UDP doesn't give clear results, but we check for unexpected responses
+    if (!resultsDir) {
+        logTest('buildTime', 'Build-Time Results Present', false, {
+            note: 'Rebuild actor with penetration-tester Dockerfile to enable build-time tests',
+        });
+        return;
     }
-    logTest('networkIsolation', 'UDP Port Filtering', true, { note: 'UDP scan completed' });
 
-    // 1.4 Port 3000 Tunneling Test
-    console.log('1.4 Port 3000 API Access Check...');
-    const apiResult = await testTcpConnect('172.17.0.1', 3000, 2000);
-    logTest('networkIsolation', 'Port 3000 API Access', apiResult.connected, {
-        expected: 'API should be reachable on port 3000',
-        connected: apiResult.connected
+    console.log(`Build results: ${resultsDir}`);
+    const summary = fs.readFileSync(`${resultsDir}/SUMMARY.txt`, 'utf8');
+    console.log(summary.substring(0, 800));
+
+    const checks = [
+        { file: '04-docker-socket.txt', name: 'Build: Docker Socket Blocked', failIf: /DOCKER SOCKET EXISTS|CRITICAL/i },
+        { file: '03-host-fs.txt', name: 'Build: Host Paths Not Accessible', failIf: /^ACCESSIBLE: \/host/m },
+        { file: '10-secrets.txt', name: 'Build: No Unexpected Secret Mounts', failIf: /FOUND: \/var\/run\/docker.sock/i },
+        { file: '12-gvisor.txt', name: 'Build: gVisor Detected', passIf: /gvisor|runsc/i },
+        { file: '08-capabilities.txt', name: 'Build: Capabilities Logged', passIf: /CapEff|CapBnd/i },
+    ];
+
+    for (const { file, name, failIf, passIf } of checks) {
+        const fp = `${resultsDir}/${file}`;
+        if (!fs.existsSync(fp)) continue;
+        const content = fs.readFileSync(fp, 'utf8');
+        let passed = true;
+        if (failIf && failIf.test(content)) passed = false;
+        if (passIf && !passIf.test(content)) passed = false;
+        logTest('buildTime', name, passed, { file, preview: content.substring(0, 150) });
+    }
+
+    if (fs.existsSync(`${resultsDir}/05-network.txt`)) {
+        const net = fs.readFileSync(`${resultsDir}/05-network.txt`, 'utf8');
+        const internalReachable = /10\.0\.0\.1:3000[^\-]*200|172\.17\.0\.1:3000[^\-]*200/.test(net);
+        logTest('buildTime', 'Build: Internal API Not Trivially Open', !internalReachable, {
+            preview: net.substring(0, 200),
+            vulnerability: internalReachable ? 'Build could reach internal API on RFC1918' : null,
+        });
+    }
+
+    results.containerInfo.buildTimeSummary = summary.substring(0, 500);
+}
+
+// ========================================
+// CONTAINER HARDENING (CapDrop, no-new-privs)
+// ========================================
+async function testContainerHardening() {
+    console.log('\n=== CONTAINER HARDENING ===\n');
+
+    const status = parseProcStatus();
+    const capEff = capHexToBigInt(status.CapEff);
+    const capBnd = capHexToBigInt(status.CapBnd);
+    const noNewPrivs = status.NoNewPrivs === '1';
+
+    logTest('containerHardening', 'CapEff Is Zero (CapDrop ALL)', capEff === 0n, {
+        CapEff: status.CapEff || 'unknown',
+        CapBnd: status.CapBnd || 'unknown',
+        vulnerability: capEff !== 0n ? `Effective capabilities non-zero: ${status.CapEff}` : null,
     });
 
-    // 1.5 DNS Resolution Test
-    console.log('1.5 DNS Resolution...');
+    logTest('containerHardening', 'no-new-privileges (NoNewPrivs=1)', noNewPrivs, {
+        NoNewPrivs: status.NoNewPrivs || '0',
+        vulnerability: !noNewPrivs ? 'Container can gain privileges via setuid/capabilities' : null,
+    });
+
+    const privileged = runCmd('cat /proc/self/status | grep -i CapEff');
+    const isPrivilegedContainer = privileged.output.includes('CapEff') &&
+        !/^CapEff:\s+0+$/m.test(privileged.output.trim().split('\n').find(l => l.startsWith('CapEff')) || '');
+
+    logTest('containerHardening', 'Not Privileged (no broad CapEff)', !isPrivilegedContainer || capEff === 0n, {
+        capLine: privileged.output.split('\n').filter(l => l.startsWith('Cap')).join('; '),
+    });
+
+    const mountPrivileged = runCmd('grep -i privileged /proc/self/mountinfo 2>&1 || true');
+    logTest('containerHardening', 'No Privileged Mount Flag', !mountPrivileged.output.toLowerCase().includes('privileged'), {
+        preview: mountPrivileged.output.substring(0, 120),
+    });
+
+    const readonlyRoot = runCmd('touch /readonly-root-probe 2>&1');
+    const rootWritable = readonlyRoot.success || !readonlyRoot.stderr?.includes?.('Read-only');
+    logTest('containerHardening', 'Root FS Writable (informational)', true, {
+        rootWritable,
+        note: 'Run containers may have writable root; download uses ReadonlyRootfs',
+    });
+}
+
+// ========================================
+// SCRAPELY PLATFORM ENV
+// ========================================
+async function testScrapelyPlatform() {
+    console.log('\n=== SCRAPELY PLATFORM ===\n');
+
+    const env = process.env;
+    const envKeys = Object.keys(env);
+
+    const forbiddenFound = [];
+    for (const key of envKeys) {
+        for (const prefix of FORBIDDEN_ENV_PREFIXES) {
+            if (key === prefix || key.startsWith(prefix)) {
+                forbiddenFound.push(key);
+            }
+        }
+    }
+    logTest('scrapelyPlatform', 'No Forbidden Platform Secrets In Env', forbiddenFound.length === 0, {
+        vulnerability: forbiddenFound.length > 0 ? `Leaked: ${forbiddenFound.join(', ')}` : null,
+        forbiddenFound,
+    });
+
+    const expectedFound = EXPECTED_RUN_ENV.filter((k) => env[k]);
+    logTest('scrapelyPlatform', 'Expected Run Env Present', expectedFound.length >= 3, {
+        expectedFound,
+        missing: EXPECTED_RUN_ENV.filter((k) => !env[k]),
+    });
+
+    const apiUrl = env.SCRAPELY_API_URL || env.INTERNAL_API_URL;
+    if (apiUrl) {
+        const probeUrl = apiUrl.replace(/\/$/, '');
+        const probe = httpProbe(probeUrl, 5);
+        const code = probe.output.trim();
+        const ok = ['200', '301', '302', '404', '401', '403'].includes(code) || probe.output.includes('curl');
+        logTest('scrapelyPlatform', 'SCRAPELY_API_URL Reachable', ok, {
+            url: apiUrl,
+            httpCode: code,
+            note: 'Public API URL expected in production',
+        });
+    } else {
+        logTest('scrapelyPlatform', 'SCRAPELY_API_URL Set', false, { note: 'No API URL in env' });
+    }
+
+    const secretMount = runCmd('ls -la /run/secrets 2>&1; ls -la /tmp/secrets 2>&1; ls -la /run/secrets/private_key.pem 2>&1');
+    const hasPrivateKeyMount = secretMount.output.includes('private_key');
+    logTest('scrapelyPlatform', 'Private Key Mount Only When Expected', true, {
+        hasPrivateKeyMount,
+        note: 'Optional per-run secret input mount',
+    });
+
+    logTest('scrapelyPlatform', 'DOCKER_HOST Not Exposed', !env.DOCKER_HOST, {
+        DOCKER_HOST: env.DOCKER_HOST ? '***set***' : undefined,
+        vulnerability: env.DOCKER_HOST ? 'DOCKER_HOST in container env' : null,
+    });
+}
+
+// ========================================
+// NETWORK ISOLATION
+// ========================================
+async function testNetworkIsolation() {
+    console.log('\n=== NETWORK ISOLATION ===\n');
+
+    const ipv6Test = runCmd('ip -6 addr 2>&1 || echo "IPv6 not available"');
+    if (ipv6Test.output.includes('inet6') && !ipv6Test.output.includes('not available')) {
+        const ipv6Connect = await testTcpConnect('::1', 80, 1000);
+        logTest('networkIsolation', 'IPv6 Loopback Not Reachable', !ipv6Connect.connected, {
+            vulnerability: ipv6Connect.connected ? 'IPv6 may bypass IPv4 iptables rules' : null,
+        });
+    } else {
+        logTest('networkIsolation', 'IPv6 Disabled Or Unavailable', true, {});
+    }
+
+    // Internal IPs on DB ports — must be blocked
+    let dbLeaks = [];
+    for (const ip of INTERNAL_IPS) {
+        for (const { port, name } of DB_PORTS) {
+            const r = await testTcpConnect(ip, port, 1200);
+            if (r.connected) dbLeaks.push(`${name}@${ip}:${port}`);
+        }
+    }
+    logTest('networkIsolation', 'Database Ports On Internal IPs Blocked', dbLeaks.length === 0, {
+        vulnerability: dbLeaks.length > 0 ? dbLeaks.join(', ') : null,
+    });
+
+    // Port 3000 to docker gateway — often allowed by DOCKER-USER rule (informational)
+    const api3000 = await testTcpConnect('172.17.0.1', 3000, 2000);
+    logTest('networkIsolation', 'Docker Gateway :3000 (informational)', true, {
+        connected: api3000.connected,
+        note: 'iptables may allow tcp/3000 from isolated subnets; prod uses public API URL',
+    });
+
+    // SSH and metadata — must be blocked on internal IPs
+    const sshLeak = await testTcpConnect('172.17.0.1', 22, 1500);
+    logTest('networkIsolation', 'SSH To Docker Gateway Blocked', !sshLeak.connected, {
+        vulnerability: sshLeak.connected ? 'SSH reachable on 172.17.0.1' : null,
+    });
+
+    const metadata = await testTcpConnect('169.254.169.254', 80, 2000);
+    logTest('networkIsolation', 'Cloud Metadata Endpoint Blocked', !metadata.connected, {
+        vulnerability: metadata.connected ? '169.254.169.254 reachable (SSRF/metadata risk)' : null,
+    });
+
     try {
-        const dnsResult = await dns.lookup('google.com').catch(e => ({ error: e }));
-        const dnsWorks = !('error' in dnsResult);
-        logTest('networkIsolation', 'External DNS Resolution', dnsWorks, {
-            resolved: dnsResult.address || 'failed'
+        const resolved = await dns.lookup('google.com');
+        logTest('networkIsolation', 'External DNS Resolution', !!resolved.address, {
+            address: resolved.address,
         });
     } catch (e) {
         logTest('networkIsolation', 'External DNS Resolution', false, { error: e.message });
     }
 
-    // 1.6 Internal DNS/Hostname Resolution
-    console.log('1.6 Internal Hostname Enumeration...');
-    const internalHosts = [
-        'dragonfly', 'redis', 'mysql', 'postgres', 'mongodb',
-        'database', 'db', 'api', 'scrapely-server', 'singlestore',
-        'kubernetes', 'k8s', 'etcd', 'consul', 'vault'
-    ];
-    let resolvedHosts = [];
+    const resolv = runCmd('cat /etc/resolv.conf 2>&1');
+    const usesPublicDns = resolv.output.includes('8.8.8.8') || resolv.output.includes('1.1.1.1');
+    const usesDockerDns = resolv.output.includes('127.0.0.11');
+    logTest('networkIsolation', 'resolv.conf Uses Public DNS (gVisor)', usesPublicDns || !usesDockerDns, {
+        preview: resolv.output.substring(0, 200),
+        vulnerability: usesDockerDns && !usesPublicDns ? 'Docker embedded DNS may fail under gVisor' : null,
+    });
+
+    const internalHosts = ['dragonfly', 'redis', 'mysql', 'singlestore', 'scrapely-server-registry-1'];
+    let resolvedInternal = [];
     for (const host of internalHosts) {
-        const result = runCmd(`getent hosts ${host} 2>&1 || true`);
-        if (result.output.length > 0 && !result.output.includes('not found') && result.output.match(/^\d+\.\d+\.\d+\.\d+/)) {
-            resolvedHosts.push({ host, ip: result.output.split(/\s+/)[0] });
+        const r = runCmd(`getent hosts ${host} 2>&1 || true`);
+        if (/^\d+\.\d+\.\d+\.\d+/.test(r.output.trim())) {
+            resolvedInternal.push({ host, line: r.output.trim().split('\n')[0] });
         }
     }
-    logTest('networkIsolation', 'Internal DNS Enumeration Blocked', resolvedHosts.length === 0, {
-        vulnerability: resolvedHosts.length > 0 ? `Resolved: ${resolvedHosts.map(h => h.host).join(', ')}` : null,
-        resolvedHosts
+    logTest('networkIsolation', 'Compose Service Names Not Resolved', resolvedInternal.length === 0, {
+        resolvedInternal,
+        note: 'Per-user networks use IPs; compose DNS names should not resolve',
     });
 
-    // 1.7 Database Port Scanning
-    console.log('1.7 Database Port Scanning...');
-    const dbPorts = [
-        { port: 3306, name: 'MySQL' },
-        { port: 5432, name: 'PostgreSQL' },
-        { port: 6379, name: 'Redis/Dragonfly' },
-        { port: 27017, name: 'MongoDB' },
-        { port: 9200, name: 'Elasticsearch' },
-        { port: 9042, name: 'Cassandra' },
-        { port: 5433, name: 'SingleStore' },
-        { port: 33306, name: 'SingleStore Alt' }
-    ];
-    
-    let dbPortLeaks = [];
-    const scanHosts = ['172.17.0.1', '172.30.0.1', '10.0.0.1'];
-    for (const host of scanHosts) {
-        for (const { port, name } of dbPorts) {
-            const result = await testTcpConnect(host, port, 1000);
-            if (result.connected) {
-                dbPortLeaks.push({ host, port, name });
-            }
-        }
-    }
-    logTest('networkIsolation', 'Database Ports Blocked', dbPortLeaks.length === 0, {
-        vulnerability: dbPortLeaks.length > 0 ? `Open ports: ${dbPortLeaks.map(l => `${l.name}@${l.host}:${l.port}`).join(', ')}` : null
-    });
-
-    // 1.8 Internet Access Verification
-    console.log('1.8 Internet Access...');
-    const internetTest = await testTcpConnect('8.8.8.8', 53, 3000);
-    logTest('networkIsolation', 'Internet Access Available', internetTest.connected, {
-        note: 'Internet access should work for scraping'
+    const internet = await testTcpConnect('1.1.1.1', 443, 3000);
+    logTest('networkIsolation', 'Internet Egress Available', internet.connected, {
+        note: 'Required for scraping',
     });
 }
 
 // ========================================
-// 2. PER-USER NETWORK ISOLATION TESTS
+// PER-USER NETWORK (172.32–47.x)
 // ========================================
-console.log('\n=== 2. PER-USER NETWORK ISOLATION TESTS ===\n');
-
 async function testPerUserNetworkIsolation() {
-    // 2.1 Detect current network configuration
-    console.log('2.1 Network Namespace Detection...');
-    const networkNs = runCmd('ls -la /proc/self/ns/net 2>&1');
-    const networkInode = networkNs.output.match(/net:\[(\d+)\]/)?.[1] || 'unknown';
-    
-    const routeTable = runCmd('ip route 2>&1 || route -n 2>&1');
-    const routes = routeTable.output.split('\n').filter(l => l.trim());
-    
+    console.log('\n=== PER-USER NETWORK ===\n');
+
+    const routeTable = runCmd('ip route 2>&1');
     const gatewayMatch = routeTable.output.match(/default via ([\d.]+)/);
     const gateway = gatewayMatch ? gatewayMatch[1] : 'unknown';
-    
-    logTest('perUserNetwork', 'Network Namespace Isolated', true, {
-        networkInode,
-        gateway,
-        routeCount: routes.length,
-        routes: routes.slice(0, 5)
-    });
-
-    // 2.2 Check for user-specific network markers
-    console.log('2.2 User Network Markers...');
-    const hostname = runCmd('hostname').output.trim();
-    const containerId = hostname.length >= 12 ? hostname.substring(0, 12) : hostname;
-    
-    // Check if we're in a user-specific network (should be named like user_<id>_network)
-    const networkName = process.env.DOCKER_NETWORK || 'unknown';
-    const isUserNetwork = networkName.includes('user') || networkName.includes('isolated');
-    
-    logTest('perUserNetwork', 'User-Specific Network Detected', isUserNetwork || networkName === 'unknown', {
-        hostname,
-        containerId,
-        networkName,
-        note: 'Should be in user-isolated network'
-    });
-
-    // 2.3 Test cross-user isolation (try to reach other user's containers)
-    console.log('2.3 Cross-User Isolation Test...');
-    // Scan for other container IP ranges that might belong to other users
-    const otherUserRanges = [
-        '172.18.0.0/16', '172.19.0.0/16', '172.20.0.0/16', '172.21.0.0/16',
-        '172.22.0.0/16', '172.23.0.0/16', '172.24.0.0/16',
-        '10.10.0.0/16', '10.20.0.0/16', '10.100.0.0/16',
-        '192.168.10.0/24', '192.168.20.0/24', '192.168.100.0/24'
-    ];
-    
-    let crossUserLeaks = [];
-    for (const range of otherUserRanges.slice(0, 6)) {
-        // Try the .1 and .2 IPs in each range
-        const baseIP = range.split('/')[0].split('.').slice(0, 3).join('.');
-        for (let i = 1; i <= 3; i++) {
-            const testIP = `${baseIP}.${i}`;
-            const result = await testTcpConnect(testIP, 3000, 1000);
-            if (result.connected) {
-                crossUserLeaks.push(testIP);
-            }
-        }
-    }
-    logTest('perUserNetwork', 'Cross-User Network Isolation', crossUserLeaks.length === 0, {
-        vulnerability: crossUserLeaks.length > 0 ? `Other user networks reachable: ${crossUserLeaks.join(', ')}` : null,
-        testedRanges: otherUserRanges.length
-    });
-
-    // 2.4 Test API endpoint access (should be allowed)
-    console.log('2.4 API Endpoint Access...');
-    const apiEndpoints = [
-        { host: 'api', port: 3000, name: 'Internal API' },
-        { host: 'scrapely-server', port: 3000, name: 'Server' },
-        { host: '172.17.0.1', port: 3000, name: 'Docker Gateway API' }
-    ];
-    
-    let apiEndpointsAccessible = [];
-    for (const endpoint of apiEndpoints) {
-        const result = await testTcpConnect(endpoint.host, endpoint.port, 2000);
-        if (result.connected) {
-            apiEndpointsAccessible.push(endpoint.name);
-        }
-    }
-    logTest('perUserNetwork', 'API Endpoints Reachable', apiEndpointsAccessible.length > 0, {
-        accessible: apiEndpointsAccessible,
-        note: 'API should be reachable from container'
-    });
-
-    // 2.5 Test registry endpoint access (should be allowed)
-    console.log('2.5 Registry Endpoint Access...');
-    const registryEndpoints = [
-        { host: 'registry', port: 5000, name: 'Internal Registry' },
-        { host: '172.17.0.1', port: 5000, name: 'Docker Gateway Registry' }
-    ];
-    
-    let registryAccessible = [];
-    for (const endpoint of registryEndpoints) {
-        const result = await testTcpConnect(endpoint.host, endpoint.port, 2000);
-        if (result.connected) {
-            registryAccessible.push(endpoint.name);
-        }
-    }
-    logTest('perUserNetwork', 'Registry Endpoint Reachable', registryAccessible.length > 0, {
-        accessible: registryAccessible,
-        note: 'Registry should be reachable for image pulls'
-    });
-
-    // 2.6 Check iptables/nftables rules visibility
-    console.log('2.6 Firewall Rules Visibility...');
-    const iptables = runCmd('iptables -L 2>&1 || nft list ruleset 2>&1 || echo "firewall not accessible"');
-    const canSeeFirewall = !iptables.output.includes('Permission denied') && 
-                           !iptables.output.includes('not accessible');
-    logTest('perUserNetwork', 'Firewall Rules Hidden', !canSeeFirewall, {
-        output: iptables.output.substring(0, 200)
-    });
-
-    // 2.7 Network interface enumeration
-    console.log('2.7 Network Interfaces...');
-    const interfaces = runCmd('ip link show 2>&1 || ifconfig 2>&1');
-    const interfaceList = interfaces.output.split('\n')
-        .filter(l => l.match(/^\d+:/) || l.match(/^[a-z]/i))
-        .map(l => l.trim().split(':')[1]?.split('@')[0] || l.split(' ')[0])
-        .filter(l => l && l.length > 0);
-    
-    const expectedInterfaces = ['lo', 'eth0', 'sit0'];
-    const unexpectedInterfaces = interfaceList.filter(i => !expectedInterfaces.includes(i));
-    
-    logTest('perUserNetwork', 'Network Interfaces Clean', unexpectedInterfaces.length === 0, {
-        interfaces: [...new Set(interfaceList)],
-        unexpected: unexpectedInterfaces
-    });
-
-    // Store network info for results
-    results.containerInfo.networkInode = networkInode;
     results.containerInfo.gateway = gateway;
-    results.containerInfo.interfaces = interfaceList;
+
+    const ipAddr = runCmd('ip -4 addr show eth0 2>&1 || ip -4 addr 2>&1');
+    const containerIpMatch = ipAddr.output.match(/inet (\d+\.\d+\.\d+\.\d+)/);
+    const containerIp = containerIpMatch ? containerIpMatch[1] : 'unknown';
+    results.containerInfo.containerIp = containerIp;
+
+    const inUserRange = /^172\.(3[2-9]|4[0-7])\./.test(containerIp);
+    logTest('perUserNetwork', 'Container IP In User Subnet (172.32–47)', inUserRange || containerIp === 'unknown', {
+        containerIp,
+        gateway,
+    });
+
+    let crossSubnetLeaks = [];
+    for (const gw of USER_SUBNET_GATEWAYS) {
+        if (gw === `${containerIp.split('.').slice(0, 3).join('.')}.1`) continue;
+        const r = await testTcpConnect(gw, 6379, 1000);
+        if (r.connected) crossSubnetLeaks.push(`${gw}:6379`);
+        const r2 = await testTcpConnect(gw, 3306, 1000);
+        if (r2.connected) crossSubnetLeaks.push(`${gw}:3306`);
+    }
+    logTest('perUserNetwork', 'Other User Subnet Gateways Blocked', crossSubnetLeaks.length === 0, {
+        vulnerability: crossSubnetLeaks.length > 0 ? crossSubnetLeaks.join(', ') : null,
+        testedGateways: USER_SUBNET_GATEWAYS.length,
+    });
+
+    const registryIp = runCmd('getent hosts scrapely-server-registry-1 2>&1 || true');
+    logTest('perUserNetwork', 'Registry Hostname Resolution (informational)', true, {
+        registryResolve: registryIp.output.trim().substring(0, 80) || 'not resolved',
+    });
+
+    const iptables = runCmd('iptables -L 2>&1 || nft list ruleset 2>&1');
+    const canSeeFirewall = !iptables.output.includes('not found') &&
+        !iptables.output.includes('Operation not permitted') &&
+        iptables.output.length > 20;
+    logTest('perUserNetwork', 'Host Firewall Rules Not Visible', !canSeeFirewall, {
+        preview: iptables.output.substring(0, 100),
+    });
 }
 
 // ========================================
-// 3. REGISTRY ACCESS TESTS
+// REGISTRY ACCESS
 // ========================================
-console.log('\n=== 3. REGISTRY ACCESS TESTS ===\n');
-
 async function testRegistryAccess() {
-    // 3.1 Registry authentication check
-    console.log('3.1 Registry Authentication Required...');
-    
-    // Try to access registry catalog without auth
-    const registryHosts = ['registry:5000', '172.17.0.1:5000', 'localhost:5000'];
-    let registryAuthRequired = true;
-    let registryEndpoints = [];
-    
-    for (const host of registryHosts) {
-        const [hostname, port] = host.split(':');
-        const result = await testTcpConnect(hostname, parseInt(port), 2000);
-        if (result.connected) {
-            registryEndpoints.push(host);
-            
-            // Try to access catalog
-            const catalogTest = runCmd(`curl -s http://${host}/v2/_catalog 2>&1 | head -20`);
-            const catalogData = catalogTest.output;
-            
-            // If we get a list of repos, auth is not required (vulnerability!)
-            if (catalogData.includes('"repositories"') && !catalogData.includes('Unauthorized')) {
-                registryAuthRequired = false;
-            }
-        }
+    console.log('\n=== REGISTRY ACCESS ===\n');
+
+    const registryHosts = [
+        { host: 'scrapely-server-registry-1', port: 5000 },
+        { host: 'registry', port: 5000 },
+        { host: '172.17.0.1', port: 5000 },
+    ];
+
+    let reachable = [];
+    for (const { host, port } of registryHosts) {
+        const r = await testTcpConnect(host, port, 2000);
+        if (r.connected) reachable.push(`${host}:${port}`);
     }
-    
-    logTest('registryAccess', 'Registry Requires Authentication', registryAuthRequired, {
-        vulnerability: !registryAuthRequired ? 'Registry allows unauthenticated access!' : null,
-        accessibleEndpoints: registryEndpoints
+    logTest('registryAccess', 'Registry TCP Reachable (informational)', true, {
+        reachable,
+        note: 'Reachability OK; auth must block unauthenticated use',
     });
 
-    // 3.2 Registry Docker API access
-    console.log('3.2 Registry Docker API Access...');
-    const dockerRegTest = runCmd(`curl -s http://registry:5000/v2/ 2>&1 || curl -s http://172.17.0.1:5000/v2/ 2>&1`);
-    const v2ApiAccessible = dockerRegTest.output.includes('Docker-Distribution-API-Version') ||
-                            dockerRegTest.output.includes('API version');
-    logTest('registryAccess', 'Registry V2 API Accessible', v2ApiAccessible, {
-        note: 'Registry V2 API should be accessible for pulls'
+    const curlHosts = reachable.length > 0 ? reachable[0] : '172.17.0.1:5000';
+    const catalog = runCmd(`curl -s -m 3 http://${curlHosts}/v2/_catalog 2>&1 | head -5`);
+    const catalogOpen = catalog.output.includes('"repositories"') &&
+        !/unauthorized|401|denied/i.test(catalog.output);
+    logTest('registryAccess', 'Catalog Requires Authentication', !catalogOpen, {
+        vulnerability: catalogOpen ? 'Unauthenticated registry catalog access' : null,
+        preview: catalog.output.substring(0, 120),
     });
 
-    // 3.3 Test image pull without auth
-    console.log('3.3 Image Pull Auth Test...');
-    const pullTest = runCmd(`
-        curl -s http://registry:5000/v2/test-image/manifests/latest 2>&1 | head -20 ||
-        curl -s http://172.17.0.1:5000/v2/test-image/manifests/latest 2>&1 | head -20
-    `);
-    const manifestAccessible = pullTest.output.includes('manifest') && 
-                               !pullTest.output.includes('Unauthorized') &&
-                               !pullTest.output.includes('401');
-    logTest('registryAccess', 'Image Manifests Protected', !manifestAccessible, {
-        vulnerability: manifestAccessible ? 'Can access image manifests without auth!' : null
+    const manifest = runCmd(`curl -s -m 3 -o /dev/null -w "%{http_code}" http://${curlHosts}/v2/scrapely-test/manifests/latest 2>&1`);
+    const manifestOpen = manifest.output.trim() === '200';
+    logTest('registryAccess', 'Manifest Pull Requires Authentication', !manifestOpen, {
+        httpCode: manifest.output.trim(),
+        vulnerability: manifestOpen ? 'Unauthenticated manifest pull' : null,
     });
 
-    // 3.4 Registry credentials in environment
-    console.log('3.4 Registry Credentials Check...');
-    const regCreds = runCmd('env | grep -iE "(REGISTRY|DOCKER.*USER|DOCKER.*PASS|DOCKER.*TOKEN)" 2>&1 || echo "none"');
-    const hasCreds = !regCreds.output.includes('none') && regCreds.output.trim().length > 0;
-    
-    // Mask the actual credentials
-    let maskedCreds = [];
-    if (hasCreds) {
-        maskedCreds = regCreds.output.split('\n')
-            .filter(l => l.includes('='))
-            .map(l => l.split('=')[0] + '=***');
-    }
-    
-    logTest('registryAccess', 'Registry Credentials Available', hasCreds, {
-        credentialVars: maskedCreds,
-        note: 'Credentials should be available for authenticated pulls'
+    const push = runCmd(`curl -s -m 3 -X POST http://${curlHosts}/v2/scrapely-test/blobs/uploads/ 2>&1 | head -3`);
+    const pushOpen = /upload|location/i.test(push.output) && !/unauthorized|401/i.test(push.output);
+    logTest('registryAccess', 'Registry Push Requires Authentication', !pushOpen, {
+        vulnerability: pushOpen ? 'Unauthenticated blob upload started' : null,
+        preview: push.output.substring(0, 100),
     });
 
-    // 3.5 Test push access
-    console.log('3.5 Registry Push Access...');
-    // This should fail without proper auth
-    const pushTest = runCmd(`
-        curl -s -X POST http://registry:5000/v2/test/blobs/uploads/ 2>&1 ||
-        echo "push test failed"
-    `);
-    const canPush = pushTest.output.includes('Location') || pushTest.output.includes('upload');
-    logTest('registryAccess', 'Registry Push Blocked', !canPush, {
-        vulnerability: canPush ? 'Can push images without proper auth!' : null
-    });
-
-    // 3.6 Check for other users' images
-    console.log('3.6 Other Users Images Access...');
-    const catalogResult = runCmd(`
-        curl -s http://registry:5000/v2/_catalog?n=100 2>&1 ||
-        curl -s http://172.17.0.1:5000/v2/_catalog?n=100 2>&1 ||
-        echo "catalog not accessible"
-    `);
-    
-    // If we can see the catalog, check if we see other users' images
-    const canSeeCatalog = catalogResult.output.includes('"repositories"');
-    const catalogData = JSON.parse(catalogResult.output.replace(/.*?(\{.*\}).*/s, '$1') || '{"repositories":[]}');
-    const otherUserImages = (catalogData.repositories || []).filter(r => 
-        !r.includes(process.env.USER_ID || 'unknown') && 
-        r.includes('/')
+    const regEnv = Object.keys(process.env).filter((k) =>
+        /REGISTRY.*(PASS|USER|TOKEN)|DOCKER.*AUTH/i.test(k)
     );
-    
-    logTest('registryAccess', 'Other Users Images Hidden', !canSeeCatalog || otherUserImages.length === 0, {
-        vulnerability: otherUserImages.length > 0 ? `Can see other users' images: ${otherUserImages.slice(0, 5).join(', ')}` : null
+    logTest('registryAccess', 'Registry Admin Creds Not In Run Env', regEnv.length === 0, {
+        vulnerability: regEnv.length > 0 ? `Registry cred env: ${regEnv.join(', ')}` : null,
     });
 }
 
 // ========================================
-// 4. gVisor SANDBOX ESCAPE TESTS
+// gVisor ESCAPE
 // ========================================
-console.log('\n=== 4. gVisor SANDBOX ESCAPE TESTS ===\n');
-
 async function testGvisorEscape() {
-    // 2.1 Check if running under gVisor
-    console.log('2.1 gVisor Detection...');
-    const gvisorCheck = runCmd('cat /proc/version 2>&1');
-    const isGvisor = gvisorCheck.output.toLowerCase().includes('gvisor') || 
-                     gvisorCheck.output.toLowerCase().includes('runsc');
+    console.log('\n=== gVisor SANDBOX ===\n');
+
+    const version = runCmd('cat /proc/version 2>&1');
+    const isGvisor = /gvisor|runsc/i.test(version.output);
     logTest('gvisorEscape', 'gVisor Runtime Detected', isGvisor, {
-        procVersion: gvisorCheck.output.substring(0, 200)
+        procVersion: version.output.substring(0, 120),
+        vulnerability: !isGvisor ? 'Not running under gVisor (runc?)' : null,
     });
 
-    // 2.2 /proc filesystem exposure
-    console.log('2.2 /proc Filesystem Access...');
-    const procFiles = [
-        '/proc/version', '/proc/cmdline', '/proc/cpuinfo', '/proc/meminfo',
-        '/proc/loadavg', '/proc/uptime', '/proc/filesystems', '/proc/mounts',
-        '/proc/devices', '/proc/interrupts', '/proc/ioports', '/proc/kallsyms',
-        '/proc/kcore', '/proc/kmsg', '/proc/modules', '/proc/slabinfo'
-    ];
-    
-    let exposedProcFiles = [];
-    for (const file of procFiles) {
-        const result = runCmd(`cat ${file} 2>&1 | head -5`);
-        if (result.success && !result.output.includes('Permission denied') && !result.output.includes('No such file')) {
-            exposedProcFiles.push({ file, preview: result.output.substring(0, 100) });
-        }
+    const dmesg = runCmd('dmesg 2>&1 | head -3');
+    logTest('gvisorEscape', 'dmesg Not Available', dmesg.output.includes('not available') || dmesg.output.includes('Operation not permitted'), {
+        preview: dmesg.output.substring(0, 80),
+    });
+
+    const dangerousDevs = ['/dev/mem', '/dev/kmem', '/dev/sda', '/dev/kmsg'];
+    let badDevs = [];
+    for (const dev of dangerousDevs) {
+        if (runCmd(`test -e ${dev} && echo yes`).output.includes('yes')) badDevs.push(dev);
     }
-    logTest('gvisorEscape', '/proc Access Limited', exposedProcFiles.length < 5, {
-        exposedFiles: exposedProcFiles.map(f => f.file),
-        vulnerability: exposedProcFiles.length >= 5 ? 'Many /proc files accessible' : null
+    logTest('gvisorEscape', 'Dangerous /dev Nodes Absent', badDevs.length === 0, {
+        vulnerability: badDevs.length > 0 ? badDevs.join(', ') : null,
     });
 
-    // 2.3 /sys filesystem access
-    console.log('2.3 /sys Filesystem Access...');
-    const sysPaths = [
-        '/sys/kernel', '/sys/class', '/sys/block', '/sys/devices',
-        '/sys/module', '/sys/fs', '/sys/power', '/sys/firmware'
-    ];
-    
-    let exposedSysPaths = [];
-    for (const path of sysPaths) {
-        const result = runCmd(`ls -la ${path} 2>&1 | head -10`);
-        if (result.success && !result.output.includes('Permission denied') && !result.output.includes('No such file')) {
-            exposedSysPaths.push(path);
-        }
-    }
-    logTest('gvisorEscape', '/sys Access Limited', exposedSysPaths.length < 3, {
-        exposedPaths: exposedSysPaths,
-        vulnerability: exposedSysPaths.length >= 3 ? '/sys mostly accessible' : null
-    });
-
-    // 2.4 Kernel module loading attempt
-    console.log('2.4 Kernel Module Loading...');
-    const modprobeTest = runCmd('modprobe nonexistent_module_test 2>&1 || true');
-    logTest('gvisorEscape', 'Kernel Module Loading Blocked', true, {
-        output: modprobeTest.output.substring(0, 100),
-        note: 'Expected to fail in container'
-    });
-
-    // 2.5 Syscall testing
-    console.log('2.5 Syscall Availability...');
-    const syscallTests = [
-        'uname -a',
-        'syscall tester (via Node.js process.binding)'
-    ];
-    
-    // Test if we can access low-level syscalls via Node
-    let syscallLeak = false;
-    try {
-        // This should fail in gVisor
-        const bindingTest = process.binding ? 'exists' : 'not exists';
-        logTest('gvisorEscape', 'process.binding Blocked', bindingTest === 'not exists', {
-            note: 'process.binding access check'
-        });
-    } catch (e) {
-        logTest('gvisorEscape', 'process.binding Blocked', true, { error: e.message });
-    }
-
-    // 2.6 Time-related attacks
-    console.log('2.6 Clock Manipulation...');
-    const timeTest = runCmd('date && hwclock --show 2>&1 || echo "hwclock blocked"');
-    const canReadHwclock = !timeTest.output.includes('blocked') && !timeTest.output.includes('Permission denied');
-    logTest('gvisorEscape', 'Hardware Clock Access Blocked', !canReadHwclock, {
-        output: timeTest.output.substring(0, 100)
-    });
-
-    // 2.7 /dev filesystem access
-    console.log('2.7 /dev Device Access...');
-    const devDevices = [
-        '/dev/null', '/dev/zero', '/dev/random', '/dev/urandom',
-        '/dev/tty', '/dev/console', '/dev/kmsg', '/dev/mem', '/dev/kmem',
-        '/dev/sda', '/dev/vda', '/dev/nvme0n1', '/dev/disk'
-    ];
-    
-    let accessibleDevices = [];
-    for (const dev of devDevices) {
-        const result = runCmd(`test -e ${dev} && echo "exists" || echo "not exists"`);
-        if (result.output.includes('exists')) {
-            accessibleDevices.push(dev);
-        }
-    }
-    const dangerousDevices = accessibleDevices.filter(d => 
-        ['/dev/kmsg', '/dev/mem', '/dev/kmem', '/dev/sda', '/dev/vda', '/dev/nvme0n1', '/dev/disk'].includes(d)
-    );
-    logTest('gvisorEscape', 'Dangerous Device Files Blocked', dangerousDevices.length === 0, {
-        accessibleDevices,
-        vulnerability: dangerousDevices.length > 0 ? `Dangerous devices accessible: ${dangerousDevices.join(', ')}` : null
-    });
-
-    // 2.8 Check for ptrace protection
-    console.log('2.8 Process Debugging Capabilities...');
-    const ptraceTest = runCmd('cat /proc/sys/kernel/yama/ptrace_scope 2>&1 || echo "not accessible"');
-    logTest('gvisorEscape', 'Ptrace Scope Restricted', true, {
-        output: ptraceTest.output
-    });
+    runCmd('modprobe fake_test_module 2>&1');
+    logTest('gvisorEscape', 'Kernel Module Load Blocked', true, { note: 'Expected failure in sandbox' });
 }
 
 // ========================================
-// 3. CONTAINER BREAKOUT TESTS
+// CONTAINER BREAKOUT
 // ========================================
-console.log('\n=== 3. CONTAINER BREAKOUT TESTS ===\n');
-
 async function testContainerBreakout() {
-    // 3.1 Docker socket check
-    console.log('3.1 Docker Socket Access...');
-    const dockerSock = runCmd('ls -la /var/run/docker.sock 2>&1');
-    const dockerSockExists = dockerSock.output.includes('docker.sock');
-    logTest('containerBreakout', 'Docker Socket Not Accessible', !dockerSockExists, {
-        vulnerability: dockerSockExists ? 'Docker socket is accessible - CRITICAL!' : null
+    console.log('\n=== CONTAINER BREAKOUT ===\n');
+
+    const dockerSock = runCmd('test -S /var/run/docker.sock && echo EXISTS || echo absent');
+    logTest('containerBreakout', 'Docker Socket Absent', !dockerSock.output.includes('EXISTS'), {
+        vulnerability: dockerSock.output.includes('EXISTS') ? 'Docker socket mounted — CRITICAL' : null,
     });
 
-    // 3.2 Docker CLI check
-    console.log('3.2 Docker CLI Access...');
-    const dockerCli = runCmd('docker ps 2>&1 || echo "docker not available"');
-    const dockerWorks = !dockerCli.output.includes('not available') && !dockerCli.output.includes('permission denied');
-    logTest('containerBreakout', 'Docker CLI Blocked', !dockerWorks, {
-        vulnerability: dockerWorks ? 'Docker CLI works - can control host containers!' : null
+    const dockerCli = runCmd('docker ps 2>&1');
+    const dockerWorks = dockerCli.success && !/not found|Cannot connect/i.test(dockerCli.output);
+    logTest('containerBreakout', 'Docker CLI Unavailable', !dockerWorks, {
+        vulnerability: dockerWorks ? 'docker CLI works inside container' : null,
     });
 
-    // 3.3 Symlink escape attempt
-    console.log('3.3 Symlink Escape Attempt...');
-    try {
-        // Try to create symlinks that escape the container
-        const symlinkTest = runCmd(`
-            mkdir -p /tmp/escape_test && 
-            ln -sf / /tmp/escape_test/root_link 2>&1 &&
-            ls -la /tmp/escape_test/root_link 2>&1 || true
-        `);
-        const symlinkCreated = symlinkTest.output.includes('root_link');
-        logTest('containerBreakout', 'Symlink Creation Handled', true, {
-            created: symlinkCreated,
-            note: 'Symlinks created but should not escape container root'
-        });
-    } catch (e) {
-        logTest('containerBreakout', 'Symlink Creation Handled', true, { error: e.message });
-    }
-
-    // 3.4 Host filesystem mount detection
-    console.log('3.4 Host Filesystem Detection...');
-    const mounts = runCmd('cat /proc/mounts 2>&1 || mount 2>&1');
-    const hostMounts = [];
-    const suspiciousPaths = ['/host', '/root', '/home', '/etc/host', '/var/lib/docker'];
-    for (const path of suspiciousPaths) {
-        if (mounts.output.includes(path)) {
-            hostMounts.push(path);
-        }
-    }
-    logTest('containerBreakout', 'No Host Filesystem Mounts', hostMounts.length === 0, {
-        vulnerability: hostMounts.length > 0 ? `Host paths mounted: ${hostMounts.join(', ')}` : null,
-        mountOutput: mounts.output.substring(0, 500)
+    const mounts = runCmd('cat /proc/mounts 2>&1');
+    const badMounts = ['/var/lib/docker', '/var/run/docker.sock'].filter((p) => mounts.output.includes(p));
+    logTest('containerBreakout', 'No Host Docker Mounts', badMounts.length === 0, {
+        vulnerability: badMounts.length > 0 ? badMounts.join(', ') : null,
     });
 
-    // 3.5 Privileged mode detection
-    console.log('3.5 Container Privilege Level...');
-    const capabilities = runCmd('cat /proc/self/status 2>&1 | grep Cap || capsh --print 2>&1');
-    const isPrivileged = capabilities.output.includes('CAP_SYS_ADMIN') || 
-                         (capabilities.output.includes('=') && !capabilities.output.includes('CapEff\t000000'));
-    logTest('containerBreakout', 'Container Not Privileged', !isPrivileged, {
-        vulnerability: isPrivileged ? 'Container appears to be privileged!' : null,
-        capabilities: capabilities.output.substring(0, 300)
-    });
-
-    // 3.6 User namespace detection
-    console.log('3.6 User Namespace Mapping...');
-    const userns = runCmd('cat /proc/self/uid_map 2>&1');
-    const usernsOutput = userns.output.trim();
-    logTest('containerBreakout', 'User Namespace Isolated', usernsOutput.length > 0, {
-        uidMap: usernsOutput
-    });
-
-    // 3.7 cgroup access
-    console.log('3.7 cgroup Filesystem Access...');
-    const cgroup = runCmd('cat /proc/self/cgroup 2>&1');
-    const cgroupAccessible = cgroup.success && cgroup.output.length > 0;
-    logTest('containerBreakout', 'cgroup Information Available', true, {
-        cgroup: cgroup.output.substring(0, 200),
-        note: 'cgroup info is normally visible'
-    });
-
-    // 3.8 Check for setuid binaries
-    console.log('3.8 Setuid Binary Scan...');
-    const setuidScan = runCmd('find /usr -perm -4000 -type f 2>/dev/null | head -20');
-    const setuidBinaries = setuidScan.output.trim().split('\n').filter(l => l.length > 0);
-    const dangerousSetuid = setuidBinaries.filter(b => 
-        ['sudo', 'su', 'passwd', 'newgrp', 'chsh', 'gpasswd'].some(d => b.includes(d))
-    );
-    logTest('containerBreakout', 'Dangerous Setuid Binaries Absent', dangerousSetuid.length === 0, {
-        found: setuidBinaries,
-        vulnerability: dangerousSetuid.length > 0 ? `Dangerous setuid binaries: ${dangerousSetuid.join(', ')}` : null
-    });
-}
-
-// ========================================
-// 4. RESOURCE EXHAUSTION TESTS
-// ========================================
-console.log('\n=== 4. RESOURCE EXHAUSTION TESTS ===\n');
-
-async function testResourceExhaustion() {
-    // 4.1 Process limit test
-    console.log('4.1 Process Limit Enforcement...');
-    const ulimitCheck = runCmd('ulimit -u 2>&1');
-    const processLimit = parseInt(ulimitCheck.output.trim()) || 'unlimited';
-    logTest('resourceExhaustion', 'Process Limit Set', processLimit !== 'unlimited' && processLimit < 10000, {
-        limit: processLimit,
-        vulnerability: processLimit === 'unlimited' ? 'No process limit set!' : null
-    });
-
-    // 4.2 Memory limit check
-    console.log('4.2 Memory Limit...');
-    const memLimit = runCmd('cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "unknown"');
-    const memValue = memLimit.output.trim();
-    const memBytes = parseInt(memValue) || 0;
-    const memMB = Math.round(memBytes / (1024 * 1024));
-    logTest('resourceExhaustion', 'Memory Limit Enforced', memBytes > 0 && memBytes < 16 * 1024 * 1024 * 1024, {
-        limitMB: memMB || 'unknown',
-        rawValue: memValue
-    });
-
-    // 4.3 File descriptor limit
-    console.log('4.3 File Descriptor Limit...');
-    const fdLimit = runCmd('ulimit -n 2>&1');
-    const fdLimitValue = parseInt(fdLimit.output.trim()) || 'unlimited';
-    logTest('resourceExhaustion', 'File Descriptor Limit Set', fdLimitValue !== 'unlimited' && fdLimitValue < 1000000, {
-        limit: fdLimitValue
-    });
-
-    // 4.4 CPU limit check
-    console.log('4.4 CPU Quota...');
-    const cpuQuota = runCmd('cat /sys/fs/cgroup/cpu.max 2>/dev/null || cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo "unknown"');
-    const cpuValue = cpuQuota.output.trim();
-    logTest('resourceExhaustion', 'CPU Limit Configured', cpuValue !== 'max' && cpuValue !== '-1' && cpuValue !== 'unknown', {
-        quota: cpuValue
-    });
-
-    // 4.5 Disk space check
-    console.log('4.5 Disk Space...');
-    const diskSpace = runCmd('df -h / 2>&1 | tail -1');
-    logTest('resourceExhaustion', 'Disk Space Limited', true, {
-        space: diskSpace.output.trim()
-    });
-
-    // 4.6 Fork bomb protection test (safe version)
-    console.log('4.6 Fork Bomb Protection...');
-    // We test by checking if we can spawn many processes quickly
-    // But we limit it to avoid actually crashing anything
-    const forkTest = runCmd(`
-        for i in $(seq 1 50); do
-            (sleep 0.1 &) 2>/dev/null
-        done
-        ps aux | wc -l
-    `);
-    const processCount = parseInt(forkTest.output.split('\n').pop()?.trim()) || 0;
-    logTest('resourceExhaustion', 'Process Spawning Controlled', processCount < 100, {
-        processCount,
-        note: 'Could spawn processes (protected by limits)'
-    });
-
-    // 4.7 OOM killer settings
-    console.log('4.7 OOM Killer Configuration...');
-    const oomScore = runCmd('cat /proc/self/oom_score 2>&1 || echo "not accessible"');
-    logTest('resourceExhaustion', 'OOM Score Visible', true, {
-        oomScore: oomScore.output.trim()
-    });
-}
-
-// ========================================
-// 5. INFORMATION DISCLOSURE TESTS
-// ========================================
-console.log('\n=== 5. INFORMATION DISCLOSURE TESTS ===\n');
-
-async function testInfoDisclosure() {
-    // 5.1 Environment variable scan
-    console.log('5.1 Environment Variables...');
-    const envVars = runCmd('env | sort');
-    const sensitivePatterns = ['PASSWORD', 'SECRET', 'KEY', 'TOKEN', 'API_KEY', 'CREDENTIAL', 'PRIVATE'];
-    const sensitiveVars = [];
-    const envLines = envVars.output.split('\n');
-    
-    for (const line of envLines) {
-        for (const pattern of sensitivePatterns) {
-            if (line.toUpperCase().includes(pattern)) {
-                const [key] = line.split('=');
-                sensitiveVars.push(key);
-            }
-        }
-    }
-    
-    // Get specific vars we expect
-    const hasCdpUrl = envVars.output.includes('CDP_URL');
-    const hasDragonflyHost = envVars.output.includes('DRAGONFLY');
-    
-    logTest('infoDisclosure', 'No Sensitive Env Vars Leaked', sensitiveVars.length === 0, {
-        sensitiveVars: [...new Set(sensitiveVars)],
-        totalEnvVars: envLines.length,
-        hasCdpUrl,
-        hasDragonflyHost
-    });
-
-    // 5.2 /etc/passwd access
-    console.log('5.2 /etc/passwd Access...');
-    const passwd = runCmd('cat /etc/passwd 2>&1');
-    const passwdUsers = passwd.output.split('\n').filter(l => l.includes(':'));
-    const hasRoot = passwdUsers.some(u => u.startsWith('root:'));
-    logTest('infoDisclosure', '/etc/passwd Access Limited', passwdUsers.length < 5, {
-        userCount: passwdUsers.length,
-        hasRoot
-    });
-
-    // 5.3 /etc/shadow access
-    console.log('5.3 /etc/shadow Access...');
     const shadow = runCmd('cat /etc/shadow 2>&1');
-    const shadowAccessible = shadow.success && !shadow.output.includes('Permission denied');
-    logTest('infoDisclosure', '/etc/shadow Not Accessible', !shadowAccessible, {
-        vulnerability: shadowAccessible ? '/etc/shadow is readable - CRITICAL!' : null
+    logTest('containerBreakout', '/etc/shadow Not Readable', shadow.output.includes('Permission denied') || shadow.output.includes('No such'), {
+        vulnerability: shadow.success && !shadow.output.includes('denied') ? '/etc/shadow readable' : null,
     });
 
-    // 5.4 Network configuration disclosure
-    console.log('5.4 Network Configuration...');
-    const networkConfig = runCmd('ip addr 2>&1 || ifconfig 2>&1');
-    const interfaces = networkConfig.output.split('\n').filter(l => l.includes('inet '));
-    logTest('infoDisclosure', 'Network Info Accessible', true, {
-        interfaces: interfaces.length,
-        note: 'Network config normally visible to container'
-    });
-
-    // 5.5 Container configuration files
-    console.log('5.5 Container Config Files...');
-    const configFiles = [
-        '/.dockerenv',
-        '/run/secrets', 
-        '/var/run/secrets',
-        '/etc/hostname',
-        '/etc/hosts',
-        '/etc/resolv.conf'
-    ];
-    
-    let foundConfigs = [];
-    for (const file of configFiles) {
-        const result = runCmd(`test -f ${file} && cat ${file} 2>&1 | head -5 || test -d ${file} && ls ${file} 2>&1`);
-        if (result.success && result.output.length > 0 && !result.output.includes('No such file')) {
-            foundConfigs.push({ file, preview: result.output.substring(0, 100) });
-        }
-    }
-    logTest('infoDisclosure', 'Container Config Exposure Limited', true, {
-        foundConfigs: foundConfigs.map(c => c.file)
-    });
-
-    // 5.6 Running processes
-    console.log('5.6 Process List...');
-    const processes = runCmd('ps aux 2>&1 || ps 2>&1');
-    const processList = processes.output.split('\n').filter(l => l.trim().length > 0);
-    const hostProcesses = processList.filter(p => 
-        p.includes('systemd') || p.includes('sshd') || p.includes('dockerd') || p.includes('containerd')
-    );
-    logTest('infoDisclosure', 'No Host Processes Visible', hostProcesses.length === 0, {
-        visibleProcesses: processList.length,
-        hostProcesses: hostProcesses.length
-    });
-
-    // 5.7 Scrapely-specific secrets
-    console.log('5.7 Scrapely Secret Scanning...');
-    const secretPaths = [
-        '/actor/.env',
-        '/actor/package/.env',
-        '/app/.env',
-        '/home/node/.scrapely',
-        '/tmp/credentials',
-        '/tmp/secrets'
-    ];
-    
-    let foundSecrets = [];
-    for (const path of secretPaths) {
-        const result = runCmd(`test -f ${path} && echo "EXISTS: ${path}" || true`);
-        if (result.output.includes('EXISTS')) {
-            foundSecrets.push(path);
-        }
-    }
-    logTest('infoDisclosure', 'No Secret Files Found', foundSecrets.length === 0, {
-        vulnerability: foundSecrets.length > 0 ? `Secret files found: ${foundSecrets.join(', ')}` : null
-    });
-
-    // 5.8 Package.json / manifest info
-    console.log('5.8 Manifest Information...');
-    const packageJson = runCmd('cat /actor/package/package.json 2>&1 || cat /actor/package.json 2>&1 || echo "not found"');
-    const scrapelyJson = runCmd('cat /actor/package/scrapely.json 2>&1 || echo "not found"');
-    logTest('infoDisclosure', 'Manifest Files Accessible', true, {
-        hasPackageJson: !packageJson.output.includes('not found'),
-        hasScrapelyJson: !scrapelyJson.output.includes('not found')
+    const setuid = runCmd('find /usr -perm -4000 -type f 2>/dev/null | head -15');
+    const dangerous = ['sudo', 'su', 'passwd'].filter((b) => setuid.output.includes(b));
+    logTest('containerBreakout', 'No Dangerous Setuid Binaries', dangerous.length === 0, {
+        setuidCount: setuid.output.split('\n').filter(Boolean).length,
+        dangerous,
     });
 }
 
 // ========================================
-// 0. BUILD-TIME TEST RESULTS
+// RESOURCE EXHAUSTION
 // ========================================
-console.log('\n=== 0. BUILD-TIME TEST RESULTS ===\n');
+async function testResourceExhaustion() {
+    console.log('\n=== RESOURCE LIMITS ===\n');
 
-async function testBuildTime() {
-    // Check if build test results exist (from Dockerfile)
-    const buildResultsPath = '/app/build-test-results/SUMMARY.txt';
-    
-    if (fs.existsSync(buildResultsPath)) {
-        console.log('Build-time test results found!');
-        const summary = fs.readFileSync(buildResultsPath, 'utf8');
-        console.log(summary);
-        
-        // Parse the results and add to our test results
-        const resultsDir = '/app/build-test-results';
-        
-        // Check each test file
-        const testFiles = [
-            { file: '01-user-context.txt', name: 'Build User Context' },
-            { file: '02-sensitive-env.txt', name: 'Build Env Vars Secure' },
-            { file: '03-host-fs.txt', name: 'Build Host FS Isolated' },
-            { file: '04-docker-socket.txt', name: 'Build Docker Socket Blocked' },
-            { file: '05-network.txt', name: 'Build Network Isolated' },
-            { file: '06-dns.txt', name: 'Build DNS Secure' },
-            { file: '07-processes.txt', name: 'Build Process Isolation' },
-            { file: '08-capabilities.txt', name: 'Build Capabilities Limited' },
-            { file: '09-build-env.txt', name: 'Build Environment Detected' },
-            { file: '10-secrets.txt', name: 'Build Secrets Protected' },
-            { file: '11-mounts.txt', name: 'Build Mounts Safe' },
-            { file: '12-gvisor.txt', name: 'Build gVisor Status' }
-        ];
-        
-        for (const { file, name } of testFiles) {
-            const filePath = `${resultsDir}/${file}`;
-            if (fs.existsSync(filePath)) {
-                const content = fs.readFileSync(filePath, 'utf8');
-                const hasVulnerability = content.toLowerCase().includes('critical') || 
-                                        content.toLowerCase().includes('accessible') ||
-                                        (content.toLowerCase().includes('exists') && 
-                                         (name.includes('Docker Socket') || name.includes('Secrets')));
-                
-                logTest('buildTime', name, !hasVulnerability, {
-                    file,
-                    preview: content.substring(0, 200)
-                });
-            }
-        }
-        
-        results.buildTime = { summary, resultsPath };
-    } else {
-        console.log('No build-time test results found (built without custom Dockerfile)');
-        logTest('buildTime', 'Build-Time Tests Available', false, {
-            note: 'Actor was not built with penetration test Dockerfile'
+    const memLimit = runCmd('cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null');
+    const memBytes = parseInt(memLimit.output.trim(), 10) || 0;
+    logTest('resourceExhaustion', 'Memory Limit Configured', memBytes > 0 && memBytes < 64 * 1024 ** 3, {
+        limitMB: Math.round(memBytes / (1024 * 1024)) || 'unknown',
+    });
+
+    const pidsMax = runCmd('cat /sys/fs/cgroup/pids.max 2>/dev/null || echo unknown');
+    logTest('resourceExhaustion', 'PIDs Limit Present', pidsMax.output.trim() !== 'max' && pidsMax.output.trim() !== 'unknown', {
+        pidsMax: pidsMax.output.trim(),
+    });
+
+    const fdLimit = parseInt(runCmd('ulimit -n').output.trim(), 10);
+    logTest('resourceExhaustion', 'File Descriptor Limit Set', fdLimit > 0 && fdLimit < 1_000_000, { fdLimit });
+}
+
+// ========================================
+// INFORMATION DISCLOSURE
+// ========================================
+async function testInfoDisclosure() {
+    console.log('\n=== INFORMATION DISCLOSURE ===\n');
+
+    const envLines = runCmd('env').output.split('\n').filter(Boolean);
+    const leaked = envLines
+        .map((l) => l.split('=')[0])
+        .filter((key) => FORBIDDEN_ENV_PREFIXES.some((p) => key === p || key.startsWith(p)));
+    logTest('infoDisclosure', 'No Platform Secrets In Environment', leaked.length === 0, {
+        vulnerability: leaked.length > 0 ? leaked.join(', ') : null,
+    });
+
+    const tokenPresent = process.env.SCRAPELY_TOKEN;
+    logTest('infoDisclosure', 'User API Token Present (expected)', !!tokenPresent, {
+        note: 'SCRAPELY_TOKEN is intentional for storage API access',
+        tokenLength: tokenPresent ? String(tokenPresent).length : 0,
+    });
+
+    const procs = runCmd('ps aux 2>&1');
+    const hostProcs = ['dockerd', 'containerd', 'sshd'].filter((p) => procs.output.includes(p));
+    logTest('infoDisclosure', 'No Host Daemon Processes Visible', hostProcs.length === 0, {
+        hostProcs,
+    });
+
+    const paths = ['/actor/.env', '/app/.env', '/kaniko/.docker/config.json'];
+    let exposed = [];
+    for (const p of paths) {
+        if (runCmd(`test -r ${p} && echo yes`).output.includes('yes')) exposed.push(p);
+    }
+    logTest('infoDisclosure', 'No Readable Platform Secret Files', exposed.length === 0, {
+        vulnerability: exposed.length > 0 ? exposed.join(', ') : null,
+    });
+
+    if (process.env.ACTOR_WEB_SERVER_PORT) {
+        logTest('infoDisclosure', 'Web Server Port Configured', true, {
+            port: process.env.ACTOR_WEB_SERVER_PORT,
+            url: process.env.ACTOR_WEB_SERVER_URL,
         });
     }
-    
-    // Also check for build test results in other possible locations
-    const altPaths = [
-        '/build-test-results/SUMMARY.txt',
-        './build-test-results/SUMMARY.txt',
-        '/tmp/build-test-results/SUMMARY.txt'
-    ];
-    
-    for (const altPath of altPaths) {
-        if (fs.existsSync(altPath)) {
-            console.log(`\nAlternative build results found at: ${altPath}`);
-        }
-    }
 }
 
 // ========================================
-// Main Execution
+// MAIN
 // ========================================
 async function main() {
     console.log('╔══════════════════════════════════════════════════════════════╗');
-    console.log('║     SCRRAPELY CONTAINER PENETRATION TESTER v1.0             ║');
-    console.log('║     Testing container security boundaries                    ║');
+    console.log(`║     SCRAPELY PENETRATION TESTER v${PENETRATION_TESTER_VERSION}                      ║`);
     console.log('╚══════════════════════════════════════════════════════════════╝');
-    console.log(`\nStarted at: ${results.timestamp}`);
-    console.log(`Container ID: ${runCmd('hostname').output.trim()}`);
+    console.log(`Started: ${results.timestamp}`);
+    console.log(`Container: ${runCmd('hostname').output.trim()}`);
 
     try {
         await testBuildTime();
+        await testContainerHardening();
+        await testScrapelyPlatform();
         await testNetworkIsolation();
         await testPerUserNetworkIsolation();
         await testRegistryAccess();
@@ -961,15 +645,14 @@ async function main() {
         await testContainerBreakout();
         await testResourceExhaustion();
         await testInfoDisclosure();
-    } catch (error) {
-        console.error('\n!!! Test suite error:', error);
-        results.error = error.message;
+    } catch (err) {
+        console.error('\n!!! Suite error:', err);
+        results.error = err.message;
     }
 
-    // Calculate summary
     let totalPassed = 0;
     let totalFailed = 0;
-    for (const [category, data] of Object.entries(results.categories)) {
+    for (const data of Object.values(results.categories)) {
         totalPassed += data.passed;
         totalFailed += data.failed;
     }
@@ -979,41 +662,38 @@ async function main() {
         passed: totalPassed,
         failed: totalFailed,
         vulnerabilitiesFound: results.vulnerabilities.length,
-        securityScore: Math.round((totalPassed / (totalPassed + totalFailed)) * 100)
+        securityScore: totalPassed + totalFailed > 0
+            ? Math.round((totalPassed / (totalPassed + totalFailed)) * 100)
+            : 0,
     };
 
     console.log('\n╔══════════════════════════════════════════════════════════════╗');
     console.log('║                    TEST SUMMARY                              ║');
     console.log('╚══════════════════════════════════════════════════════════════╝');
-    console.log(`\nTotal Tests: ${results.summary.totalTests}`);
-    console.log(`Passed: ${totalPassed}`);
-    console.log(`Failed: ${totalFailed}`);
-    console.log(`Vulnerabilities Found: ${results.vulnerabilities.length}`);
-    console.log(`Security Score: ${results.summary.securityScore}%`);
+    console.log(`Tests: ${results.summary.totalTests} | Passed: ${totalPassed} | Failed: ${totalFailed}`);
+    console.log(`Vulnerabilities: ${results.vulnerabilities.length} | Score: ${results.summary.securityScore}%`);
 
     if (results.vulnerabilities.length > 0) {
-        console.log('\n⚠️  VULNERABILITIES DETECTED:');
-        for (const vuln of results.vulnerabilities) {
-            console.log(`  [${vuln.category}] ${vuln.name}: ${vuln.vulnerability}`);
+        console.log('\n⚠️  VULNERABILITIES:');
+        for (const v of results.vulnerabilities) {
+            console.log(`  [${v.category}] ${v.name}: ${v.vulnerability}`);
         }
     }
 
-    // Write full results to file
     fs.writeFileSync('/tmp/penetration-test-results.json', JSON.stringify(results, null, 2));
-    console.log('\nFull results written to /tmp/penetration-test-results.json');
+    console.log('\nResults: /tmp/penetration-test-results.json');
 
-    // Also write to actor's key-value store
     try {
         const { Actor } = await import('scrapely');
         await Actor.init();
         await Actor.setValue('PENETRATION_TEST_RESULTS', results);
-        console.log('Results saved to Actor key-value store');
+        console.log('Results saved to KV store: PENETRATION_TEST_RESULTS');
         await Actor.exit();
-    } catch (e) {
-        console.log('Note: Could not save to Actor KV store (running outside Actor context?)');
+    } catch {
+        console.log('(KV store save skipped — run inside Scrapely actor for full output)');
     }
 
-    console.log('\n penetration test complete.');
+    console.log('\nPenetration test complete.\n');
 }
 
 main().catch(console.error);

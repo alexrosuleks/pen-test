@@ -71,7 +71,9 @@ RUN echo "=== BUILD TEST 4: Docker Socket ===" && \
 # Test 5: Network access during build
 RUN echo "=== BUILD TEST 5: Network Access ===" && \
     echo "Testing network connectivity..." > /build-test-results/05-network.txt && \
-    timeout 2 curl -s http://172.17.0.1:3000 >> /build-test-results/05-network.txt 2>&1 || echo "172.17.0.1:3000 - blocked or timeout" >> /build-test-results/05-network.txt; \
+    timeout 2 bash -c 'echo >/dev/tcp/172.17.0.1/3306' 2>/dev/null && echo "172.17.0.1:3306 - open" >> /build-test-results/05-network.txt || echo "172.17.0.1:3306 - blocked" >> /build-test-results/05-network.txt; \
+    timeout 2 bash -c 'echo >/dev/tcp/172.17.0.1/22' 2>/dev/null && echo "172.17.0.1:22 - open" >> /build-test-results/05-network.txt || echo "172.17.0.1:22 - blocked" >> /build-test-results/05-network.txt; \
+    timeout 2 bash -c 'echo >/dev/tcp/169.254.169.254/80' 2>/dev/null && echo "169.254.169.254:80 - open" >> /build-test-results/05-network.txt || echo "169.254.169.254:80 - blocked" >> /build-test-results/05-network.txt; \
     timeout 2 curl -s http://172.30.0.1:3000 >> /build-test-results/05-network.txt 2>&1 || echo "172.30.0.1:3000 - blocked or timeout" >> /build-test-results/05-network.txt; \
     timeout 2 curl -s http://10.0.0.1:3000 >> /build-test-results/05-network.txt 2>&1 || echo "10.0.0.1:3000 - blocked or timeout" >> /build-test-results/05-network.txt; \
     timeout 5 curl -s https://google.com >> /build-test-results/05-network.txt 2>&1 && echo "Internet accessible" >> /build-test-results/05-network.txt || echo "Internet blocked" >> /build-test-results/05-network.txt
@@ -122,6 +124,17 @@ RUN echo "=== BUILD TEST 11: Mounted Volumes ===" && \
 RUN echo "=== BUILD TEST 12: gVisor Detection ===" && \
     cat /proc/version > /build-test-results/12-gvisor.txt 2>&1 || echo "Could not read /proc/version" > /build-test-results/12-gvisor.txt; \
     dmesg 2>&1 | head -10 >> /build-test-results/12-gvisor.txt || echo "dmesg not available" >> /build-test-results/12-gvisor.txt
+
+# Test 13: Escape probes during build
+RUN echo "=== BUILD TEST 13: Escape Probes ===" > /build-test-results/13-escape.txt && \
+    cat /proc/1/root/etc/hostname >> /build-test-results/13-escape.txt 2>&1 || echo "proc/1/root blocked" >> /build-test-results/13-escape.txt; \
+    mount -t tmpfs tmpfs /tmp/build-mnt 2>&1 >> /build-test-results/13-escape.txt || echo "mount blocked" >> /build-test-results/13-escape.txt; \
+    curl -sS -m 3 http://169.254.169.254/latest/meta-data/ >> /build-test-results/13-escape.txt 2>&1 || echo "metadata HTTP blocked" >> /build-test-results/13-escape.txt
+
+# Test 14: SSRF HTTP during build
+RUN echo "=== BUILD TEST 14: SSRF HTTP ===" > /build-test-results/14-ssrf.txt && \
+    curl -sS -m 3 http://127.0.0.1:3000/health >> /build-test-results/14-ssrf.txt 2>&1 || echo "127.0.0.1 blocked" >> /build-test-results/14-ssrf.txt; \
+    curl -sS -m 3 file:///etc/passwd >> /build-test-results/14-ssrf.txt 2>&1 || echo "file:// blocked" >> /build-test-results/14-ssrf.txt
 
 # =============================================================================
 # Create summary of build-time findings

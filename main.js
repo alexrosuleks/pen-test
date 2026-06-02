@@ -1106,10 +1106,17 @@ async function testResourceExhaustion() {
     });
 
     const pidsMax = runCmd('cat /sys/fs/cgroup/pids.max 2>/dev/null || echo unknown');
-    logTest('resourceExhaustion', 'PIDs Limit Present', pidsMax.output.trim() !== 'max' && pidsMax.output.trim() !== 'unknown', {
-        pidsMax: pidsMax.output.trim(),
-        informational: true,
-        note: 'Optional — not configured on platform yet',
+    const pidsMaxVal = pidsMax.output.trim();
+    const cgroupPids = pidsMaxVal !== 'max' && pidsMaxVal !== 'unknown';
+    const nprocLim = parseInt(runCmd('ulimit -u').output.trim(), 10);
+    const envPids = parseInt(process.env.SCRAPELY_PIDS_LIMIT || '0', 10);
+    const pidsPresent = cgroupPids || (!isNaN(nprocLim) && nprocLim > 0 && envPids > 0 && nprocLim <= envPids + 1);
+    logTest('resourceExhaustion', 'PIDs Limit Present', pidsPresent, {
+        pidsMax: pidsMaxVal,
+        nprocUlimit: isNaN(nprocLim) ? undefined : nprocLim,
+        envPidsLimit: envPids || undefined,
+        informational: !cgroupPids && pidsPresent,
+        note: pidsPresent ? (cgroupPids ? 'cgroup pids.max' : 'SCRAPELY_PIDS_LIMIT + ulimit -u') : 'Set PidsLimit in worker',
     });
 
     const fdLimit = parseInt(runCmd('ulimit -n').output.trim(), 10);
@@ -1633,19 +1640,18 @@ async function runMaliciousActorProbes() {
             : 'Limited local secret material',
     });
 
-    // --- Fork / resource abuse (light) ---
-    let rapidFork = 0;
-    for (let i = 0; i < 50; i++) {
-        try {
-            execSync('true', { timeout: 300 });
-            rapidFork++;
-        } catch { break; }
-    }
-    logTest('maliciousActor', 'Rapid Fork Bomb Contained', rapidFork < 50, {
+    // --- Fork / resource abuse (concurrent; sequential execSync does not hit nproc) ---
+    const rapidForkOut = runCmd(
+        'sh -c \'hits=0; for i in $(seq 1 80); do ( true & ) 2>/dev/null && hits=$((hits+1)) || break; done; wait 2>/dev/null; echo $hits\'',
+        8000,
+    );
+    const rapidFork = parseInt((rapidForkOut.output.match(/[0-9]+/) || ['0'])[0], 10);
+    const rapidCap = parseInt(process.env.SCRAPELY_PIDS_LIMIT || '512', 10);
+    logTest('maliciousActor', 'Rapid Fork Bomb Contained', rapidFork > 0 && rapidFork < 80 && rapidFork <= rapidCap + 5, {
         spawned: rapidFork,
-        vulnerability: rapidFork >= 50 ? 'No fork limit hit in 50 spawns' : null,
-        informational: rapidFork >= 50,
-        note: rapidFork >= 50 ? 'May indicate missing pids limit' : 'Fork limited or stopped early',
+        vulnerability: rapidFork >= 80 ? 'No concurrent fork limit in 80 spawns' : null,
+        informational: rapidFork >= 80,
+        note: rapidFork >= 80 ? 'May indicate missing pids limit' : `Stopped at ${rapidFork} concurrent processes`,
     });
 }
 

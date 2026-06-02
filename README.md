@@ -31,8 +31,11 @@ Security testing actor for Scrapely container isolation. Failures indicate platf
 | Failure | Likely fix in `scrapely/` |
 |---------|--------------------------|
 | `/etc` writable, LD_PRELOAD | `ReadonlyRootfs: true` in `worker.ts` |
-| UID 0 | Enforce `User: node` on run containers |
-| PidsLimit / fork bomb | `PidsLimit` in `worker.ts` |
+| UID 0 / Platform Enforced Non-Root | **Accepted** — actors may run as root; mitigate with ReadonlyRootfs + caps |
+| PidsLimit / fork bomb | `PidsLimit` + `Ulimits.nproc` in `worker.ts`; host `runsc` needs `runtimeArgs: ["--systemd-cgroup"]` in `/etc/docker/daemon.json` (see `scripts/setup-gvisor.sh`) |
+| X-Scrapely-Run-Id 403 on own run | `isValidRunId()` in `auth.ts` (17-char hex, not UUID-only) |
+| Gateway :3306 / :8080 | Run `scripts/setup-network-isolation.sh` on host; persist iptables |
+| X-Scrapely-Run-Id spoof | Validate header in `auth.ts` against run ownership |
 | AppArmor missing post-metamorph | `apparmor=scrapely-run` on metamorph container |
 | Subnet not 172.32–47 | Fix network fallback / `config.ts` |
 | IPv6 bypass | ip6tables or disable IPv6 on user networks |

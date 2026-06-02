@@ -3,6 +3,8 @@
  * API/registry, advanced sandbox, infra ops.
  */
 
+import { detectPidsLimitSignals } from './pids-limit.js';
+
 export async function runV27Tests(ctx) {
     await testNetworkBypass(ctx);
     await testExtendedHardening(ctx);
@@ -240,39 +242,33 @@ async function testExtendedHardening(ctx) {
 }
 
 async function testExtendedResourceLimits(ctx) {
-    const { logTest, runCmd, execSync } = ctx;
+    const { logTest, runCmd, pidsSignals: cached } = ctx;
 
     console.log('\n=== EXTENDED RESOURCE LIMITS (v2.7) ===\n');
 
-    const pidsMax = runCmd('cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo max');
-    const pidsMaxVal = pidsMax.output.trim();
-    const cgroupLimited = pidsMaxVal !== 'max' && parseInt(pidsMaxVal, 10) > 0;
-    const nprocUlimit = parseInt(runCmd('ulimit -u').output.trim(), 10);
-    const envPidsLimit = parseInt(process.env.SCRAPELY_PIDS_LIMIT || '0', 10);
-    const ulimitLimited = !isNaN(nprocUlimit) && nprocUlimit > 0 && nprocUlimit < 65536
-        && (envPidsLimit <= 0 || nprocUlimit <= envPidsLimit + 1);
-    const pidsLimited = cgroupLimited || (ulimitLimited && envPidsLimit > 0);
-    logTest('resourceExhaustion', 'PidsLimit Enforced', pidsLimited, {
-        pidsMax: pidsMaxVal,
-        nprocUlimit: isNaN(nprocUlimit) ? runCmd('ulimit -u').output.trim() : nprocUlimit,
-        envPidsLimit,
-        vulnerability: !pidsLimited ? 'No PIDs limit visible (cgroup or ulimit) — set PidsLimit + SCRAPELY_PIDS_LIMIT' : null,
-        note: cgroupLimited ? 'cgroup pids.max set' : (ulimitLimited ? 'ulimit -u matches platform SCRAPELY_PIDS_LIMIT (gVisor)' : ''),
+    const pidsSignals = cached || detectPidsLimitSignals(runCmd);
+
+    logTest('resourceExhaustion', 'PidsLimit Enforced', pidsSignals.enforced, {
+        pidsMax: pidsSignals.pidsMaxVal,
+        maxProcesses: pidsSignals.proc.soft ?? undefined,
+        nprocUlimit: pidsSignals.nprocUlimit,
+        forkSpawned: pidsSignals.fork.forkHit,
+        sources: pidsSignals.sources.join(', ') || undefined,
+        vulnerability: !pidsSignals.enforced
+            ? 'No PIDs limit detected (cgroup, /proc/self/limits, ulimit, or fork probe)'
+            : null,
+        note: pidsSignals.enforced ? pidsSignals.sources.join('; ') : '',
     });
 
-    // Concurrent fork probe (sequential execSync does not stress nproc)
-    const forkProbe = runCmd(
-        'sh -c \'hits=0; for i in $(seq 1 600); do ( true & ) 2>/dev/null && hits=$((hits+1)) || break; done; wait 2>/dev/null; echo $hits\'',
-        15000,
-    );
-    const forkHit = parseInt((forkProbe.output.match(/[0-9]+/) || ['0'])[0], 10);
-    const expectedCap = envPidsLimit > 0 ? envPidsLimit : 512;
-    const forkLimited = forkHit > 0 && forkHit < 600 && forkHit <= expectedCap + 10;
-    logTest('resourceExhaustion', 'Fork Bomb Hits Limit', forkLimited, {
-        spawned: forkHit,
-        expectedCap,
-        vulnerability: !forkLimited ? `Spawned ${forkHit} concurrent shells (cap ~${expectedCap})` : null,
-        note: forkLimited ? `Stopped at ${forkHit} concurrent processes` : 'Raise ulimit/PidsLimit or fix runsc --systemd-cgroup on host',
+    logTest('resourceExhaustion', 'Fork Bomb Hits Limit', pidsSignals.fork.forkLimited, {
+        spawned: pidsSignals.fork.forkHit,
+        inferredCap: pidsSignals.inferredCap,
+        vulnerability: !pidsSignals.fork.forkLimited
+            ? `Spawned ${pidsSignals.fork.forkHit} concurrent shells (no cap before ${pidsSignals.fork.maxAttempts})`
+            : null,
+        note: pidsSignals.fork.forkLimited
+            ? `Stopped at ${pidsSignals.fork.forkHit} concurrent processes`
+            : 'Raise PidsLimit on worker or fix runsc --systemd-cgroup on host',
     });
 
     const fdLimit = parseInt(runCmd('ulimit -n').output.trim(), 10);

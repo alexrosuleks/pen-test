@@ -16,6 +16,7 @@ import dns from 'dns/promises';
 import fs from 'fs';
 import { execSync } from 'child_process';
 import { runV27Tests, evaluateBuildTokenResponse } from './v27-tests.js';
+import { detectPidsLimitSignals } from './pids-limit.js';
 
 const PENETRATION_TESTER_VERSION = '2.7.0';
 
@@ -1105,18 +1106,19 @@ async function testResourceExhaustion() {
         note: memBytes <= 0 && envMemMb > 0 ? 'Limit set via ACTOR_MEMORY_MBYTES (cgroup not visible under gVisor)' : null,
     });
 
-    const pidsMax = runCmd('cat /sys/fs/cgroup/pids.max 2>/dev/null || echo unknown');
-    const pidsMaxVal = pidsMax.output.trim();
-    const cgroupPids = pidsMaxVal !== 'max' && pidsMaxVal !== 'unknown';
-    const nprocLim = parseInt(runCmd('ulimit -u').output.trim(), 10);
-    const envPids = parseInt(process.env.SCRAPELY_PIDS_LIMIT || '0', 10);
-    const pidsPresent = cgroupPids || (!isNaN(nprocLim) && nprocLim > 0 && envPids > 0 && nprocLim <= envPids + 1);
-    logTest('resourceExhaustion', 'PIDs Limit Present', pidsPresent, {
-        pidsMax: pidsMaxVal,
-        nprocUlimit: isNaN(nprocLim) ? undefined : nprocLim,
-        envPidsLimit: envPids || undefined,
-        informational: !cgroupPids && pidsPresent,
-        note: pidsPresent ? (cgroupPids ? 'cgroup pids.max' : 'SCRAPELY_PIDS_LIMIT + ulimit -u') : 'Set PidsLimit in worker',
+    const pidsSignals = detectPidsLimitSignals(runCmd);
+    results.containerInfo.pidsSignals = pidsSignals;
+    logTest('resourceExhaustion', 'PIDs Limit Present', pidsSignals.present, {
+        pidsMax: pidsSignals.pidsMaxVal,
+        maxProcesses: pidsSignals.proc.soft ?? undefined,
+        nprocUlimit: pidsSignals.nprocUlimit,
+        forkSpawned: pidsSignals.fork.forkHit,
+        sources: pidsSignals.sources.join(', ') || undefined,
+        informational: pidsSignals.present && !pidsSignals.cgroupLimited,
+        note: pidsSignals.present
+            ? (pidsSignals.sources.join('; ') || 'PID cap detected')
+            : 'No PID cap visible — set PidsLimit in worker',
+        vulnerability: !pidsSignals.present ? 'No PIDs limit detected (cgroup, proc limits, ulimit, or fork probe)' : null,
     });
 
     const fdLimit = parseInt(runCmd('ulimit -n').output.trim(), 10);
@@ -1646,8 +1648,7 @@ async function runMaliciousActorProbes() {
         8000,
     );
     const rapidFork = parseInt((rapidForkOut.output.match(/[0-9]+/) || ['0'])[0], 10);
-    const rapidCap = parseInt(process.env.SCRAPELY_PIDS_LIMIT || '512', 10);
-    logTest('maliciousActor', 'Rapid Fork Bomb Contained', rapidFork > 0 && rapidFork < 80 && rapidFork <= rapidCap + 5, {
+    logTest('maliciousActor', 'Rapid Fork Bomb Contained', rapidFork > 0 && rapidFork < 80, {
         spawned: rapidFork,
         vulnerability: rapidFork >= 80 ? 'No concurrent fork limit in 80 spawns' : null,
         informational: rapidFork >= 80,
@@ -1858,6 +1859,7 @@ async function main() {
         await runV27Tests({
             logTest,
             runCmd,
+            pidsSignals: results.containerInfo.pidsSignals,
             execSync,
             testTcpConnect,
             tcpReadBanner,

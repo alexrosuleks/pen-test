@@ -72,10 +72,14 @@ RUN echo "=== BUILD TEST 4: Docker Socket ===" && \
 RUN echo "=== BUILD TEST 5: Network Access ===" && \
     echo "Testing network connectivity..." > /build-test-results/05-network.txt && \
     timeout 2 bash -c 'echo >/dev/tcp/172.17.0.1/3306' 2>/dev/null && echo "172.17.0.1:3306 - open" >> /build-test-results/05-network.txt || echo "172.17.0.1:3306 - blocked" >> /build-test-results/05-network.txt; \
+    timeout 2 bash -c 'echo >/dev/tcp/172.17.0.1/6379' 2>/dev/null && echo "172.17.0.1:6379 - open" >> /build-test-results/05-network.txt || echo "172.17.0.1:6379 - blocked" >> /build-test-results/05-network.txt; \
     timeout 2 bash -c 'echo >/dev/tcp/172.17.0.1/22' 2>/dev/null && echo "172.17.0.1:22 - open" >> /build-test-results/05-network.txt || echo "172.17.0.1:22 - blocked" >> /build-test-results/05-network.txt; \
+    timeout 2 bash -c 'echo >/dev/tcp/172.17.0.1/5000' 2>/dev/null && echo "172.17.0.1:5000 - open" >> /build-test-results/05-network.txt || echo "172.17.0.1:5000 - blocked" >> /build-test-results/05-network.txt; \
+    timeout 2 bash -c 'echo >/dev/tcp/172.32.0.1/3306' 2>/dev/null && echo "172.32.0.1:3306 - open" >> /build-test-results/05-network.txt || echo "172.32.0.1:3306 - blocked" >> /build-test-results/05-network.txt; \
     timeout 2 bash -c 'echo >/dev/tcp/169.254.169.254/80' 2>/dev/null && echo "169.254.169.254:80 - open" >> /build-test-results/05-network.txt || echo "169.254.169.254:80 - blocked" >> /build-test-results/05-network.txt; \
     timeout 2 curl -s http://172.30.0.1:3000 >> /build-test-results/05-network.txt 2>&1 || echo "172.30.0.1:3000 - blocked or timeout" >> /build-test-results/05-network.txt; \
     timeout 2 curl -s http://10.0.0.1:3000 >> /build-test-results/05-network.txt 2>&1 || echo "10.0.0.1:3000 - blocked or timeout" >> /build-test-results/05-network.txt; \
+    timeout 2 curl -sS -m 2 http://172.17.0.1:5000/v2/ >> /build-test-results/05-network.txt 2>&1 || echo "172.17.0.1:5000 http - blocked or timeout" >> /build-test-results/05-network.txt; \
     timeout 5 curl -s https://google.com >> /build-test-results/05-network.txt 2>&1 && echo "Internet accessible" >> /build-test-results/05-network.txt || echo "Internet blocked" >> /build-test-results/05-network.txt
 
 # Test 6: DNS resolution during build
@@ -83,7 +87,8 @@ RUN echo "=== BUILD TEST 6: DNS Resolution ===" && \
     echo "Testing DNS..." > /build-test-results/06-dns.txt && \
     nslookup google.com >> /build-test-results/06-dns.txt 2>&1 || echo "External DNS failed" >> /build-test-results/06-dns.txt; \
     nslookup dragonfly >> /build-test-results/06-dns.txt 2>&1 || echo "Internal DNS (dragonfly) failed" >> /build-test-results/06-dns.txt; \
-    nslookup redis >> /build-test-results/06-dns.txt 2>&1 || echo "Internal DNS (redis) failed" >> /build-test-results/06-dns.txt
+    nslookup redis >> /build-test-results/06-dns.txt 2>&1 || echo "Internal DNS (redis) failed" >> /build-test-results/06-dns.txt; \
+    nslookup singlestore >> /build-test-results/06-dns.txt 2>&1 || echo "Internal DNS (singlestore) failed" >> /build-test-results/06-dns.txt
 
 # Test 7: Process visibility
 RUN echo "=== BUILD TEST 7: Process Visibility ===" && \
@@ -98,10 +103,10 @@ RUN echo "=== BUILD TEST 8: Capabilities ===" && \
 RUN echo "=== BUILD TEST 9: Build Environment Detection ===" && \
     echo "Checking for Kaniko..." > /build-test-results/09-build-env.txt; \
     if [ -f /kaniko/executor ]; then \
-        echo "RUNNING IN KANIKO" >> /build-test-results/09-build-env.txt; \
+        echo "KANIKO_VISIBLE_IN_RUN" >> /build-test-results/09-build-env.txt; \
         ls -la /kaniko/ >> /build-test-results/09-build-env.txt 2>&1; \
     else \
-        echo "Not in Kaniko or /kaniko not visible" >> /build-test-results/09-build-env.txt; \
+        echo "Kaniko executor not visible in RUN layer (good)" >> /build-test-results/09-build-env.txt; \
     fi; \
     echo "Container runtime: $(cat /proc/1/cgroup 2>/dev/null | head -5)" >> /build-test-results/09-build-env.txt 2>&1 || true
 
@@ -127,14 +132,32 @@ RUN echo "=== BUILD TEST 12: gVisor Detection ===" && \
 
 # Test 13: Escape probes during build
 RUN echo "=== BUILD TEST 13: Escape Probes ===" > /build-test-results/13-escape.txt && \
-    cat /proc/1/root/etc/hostname >> /build-test-results/13-escape.txt 2>&1 || echo "proc/1/root blocked" >> /build-test-results/13-escape.txt; \
+    echo "container_hostname=$(cat /etc/hostname 2>/dev/null | tr -d '\n')" >> /build-test-results/13-escape.txt && \
+    echo "proc1_root_hostname=$(cat /proc/1/root/etc/hostname 2>/dev/null | tr -d '\n')" >> /build-test-results/13-escape.txt && \
+    if [ "$(cat /etc/hostname 2>/dev/null | tr -d '\n')" = "$(cat /proc/1/root/etc/hostname 2>/dev/null | tr -d '\n')" ]; then \
+        echo "proc1_hostname_matches_container" >> /build-test-results/13-escape.txt; \
+    else \
+        echo "proc1_hostname_mismatch" >> /build-test-results/13-escape.txt; \
+    fi && \
+    mkdir -p /tmp/build-mnt && \
     mount -t tmpfs tmpfs /tmp/build-mnt 2>&1 >> /build-test-results/13-escape.txt || echo "mount blocked" >> /build-test-results/13-escape.txt; \
     curl -sS -m 3 http://169.254.169.254/latest/meta-data/ >> /build-test-results/13-escape.txt 2>&1 || echo "metadata HTTP blocked" >> /build-test-results/13-escape.txt
 
 # Test 14: SSRF HTTP during build
 RUN echo "=== BUILD TEST 14: SSRF HTTP ===" > /build-test-results/14-ssrf.txt && \
     curl -sS -m 3 http://127.0.0.1:3000/health >> /build-test-results/14-ssrf.txt 2>&1 || echo "127.0.0.1 blocked" >> /build-test-results/14-ssrf.txt; \
-    curl -sS -m 3 file:///etc/passwd >> /build-test-results/14-ssrf.txt 2>&1 || echo "file:// blocked" >> /build-test-results/14-ssrf.txt
+    curl -sS -m 3 file:///etc/passwd > /tmp/file-passwd.txt 2>&1; \
+    if cmp -s /tmp/file-passwd.txt /etc/passwd 2>/dev/null; then \
+        echo "file:// is local passwd only" >> /build-test-results/14-ssrf.txt; \
+    else \
+        cat /tmp/file-passwd.txt >> /build-test-results/14-ssrf.txt; \
+        echo "file:// differs from local /etc/passwd" >> /build-test-results/14-ssrf.txt; \
+    fi
+
+# Test 15: API probes during build (no SCRAPELY_TOKEN in Kaniko env)
+RUN echo "=== BUILD TEST 15: API Probes ===" > /build-test-results/15-api-build.txt && \
+    curl -sS -m 3 http://172.30.0.1:3000/health >> /build-test-results/15-api-build.txt 2>&1 && echo "health reachable" >> /build-test-results/15-api-build.txt || echo "health blocked or timeout" >> /build-test-results/15-api-build.txt; \
+    curl -sS -m 3 -o /dev/null -w "build_token_http=%{http_code}\n" -X POST http://172.30.0.1:3000/internal/build-token >> /build-test-results/15-api-build.txt 2>&1 || echo "build_token probe failed" >> /build-test-results/15-api-build.txt
 
 # =============================================================================
 # Create summary of build-time findings
@@ -148,8 +171,8 @@ RUN echo "=== BUILD PENETRATION TEST SUMMARY ===" > /build-test-results/SUMMARY.
     echo "=== Sensitive Env Vars Found ===" >> /build-test-results/SUMMARY.txt && \
     cat /build-test-results/02-sensitive-env.txt >> /build-test-results/SUMMARY.txt 2>&1 || echo "None" >> /build-test-results/SUMMARY.txt && \
     echo "" >> /build-test-results/SUMMARY.txt && \
-    echo "=== Host FS Access ===" >> /build-test-results/SUMMARY.txt && \
-    grep "ACCESSIBLE" /build-test-results/03-host-fs.txt >> /build-test-results/SUMMARY.txt 2>&1 || echo "No host paths accessible" >> /build-test-results/SUMMARY.txt && \
+    echo "=== Host FS Access (escape paths only) ===" >> /build-test-results/SUMMARY.txt && \
+    grep -E "ACCESSIBLE: /host|ACCESSIBLE: /var/run/docker.sock" /build-test-results/03-host-fs.txt >> /build-test-results/SUMMARY.txt 2>&1 || echo "No critical host paths accessible" >> /build-test-results/SUMMARY.txt && \
     echo "" >> /build-test-results/SUMMARY.txt && \
     echo "=== Docker Socket ===" >> /build-test-results/SUMMARY.txt && \
     cat /build-test-results/04-docker-socket.txt >> /build-test-results/SUMMARY.txt 2>&1 || true && \

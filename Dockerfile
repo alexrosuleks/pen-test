@@ -154,10 +154,27 @@ RUN echo "=== BUILD TEST 14: SSRF HTTP ===" > /build-test-results/14-ssrf.txt &&
         echo "file:// differs from local /etc/passwd" >> /build-test-results/14-ssrf.txt; \
     fi
 
-# Test 15: API probes during build (no SCRAPELY_TOKEN in Kaniko env)
+# Test 15: API probes during build (gateway-aware, no SCRAPELY_TOKEN in Kaniko env)
 RUN echo "=== BUILD TEST 15: API Probes ===" > /build-test-results/15-api-build.txt && \
-    curl -sS -m 3 http://172.30.0.1:3000/health >> /build-test-results/15-api-build.txt 2>&1 && echo "health reachable" >> /build-test-results/15-api-build.txt || echo "health blocked or timeout" >> /build-test-results/15-api-build.txt; \
-    curl -sS -m 3 -o /dev/null -w "build_token_http=%{http_code}\n" -X POST http://172.30.0.1:3000/internal/build-token >> /build-test-results/15-api-build.txt 2>&1 || echo "build_token probe failed" >> /build-test-results/15-api-build.txt
+    GATEWAY=$(ip route 2>/dev/null | awk '/default/{print $3; exit}') && \
+    echo "build_gateway=${GATEWAY:-unknown}" >> /build-test-results/15-api-build.txt && \
+    if [ -n "$GATEWAY" ]; then \
+        curl -sS -m 3 "http://${GATEWAY}:3000/health" >> /build-test-results/15-api-build.txt 2>&1 && echo "health reachable" >> /build-test-results/15-api-build.txt || echo "health blocked or timeout" >> /build-test-results/15-api-build.txt; \
+        curl -sS -m 3 -o /dev/null -w "build_token_http=%{http_code}\n" -X POST "http://${GATEWAY}:3000/internal/build-token" >> /build-test-results/15-api-build.txt 2>&1 || echo "build_token probe failed" >> /build-test-results/15-api-build.txt; \
+    else \
+        echo "health blocked or timeout" >> /build-test-results/15-api-build.txt; \
+        echo "build_token probe failed" >> /build-test-results/15-api-build.txt; \
+    fi
+
+# Test 16: Gateway-aware network bypass probes during build
+RUN echo "=== BUILD TEST 16: Network Bypass ===" > /build-test-results/16-network-bypass-build.txt && \
+    GATEWAY=$(ip route 2>/dev/null | awk '/default/{print $3; exit}') && \
+    echo "build_gateway=${GATEWAY:-unknown}" >> /build-test-results/16-network-bypass-build.txt && \
+    if [ -n "$GATEWAY" ]; then \
+        curl -sS -m 3 -o /dev/null -w "build_token_http=%{http_code}\n" -X POST "http://${GATEWAY}:3000/internal/build-token" >> /build-test-results/16-network-bypass-build.txt 2>&1 || echo "build_token probe failed" >> /build-test-results/16-network-bypass-build.txt; \
+        timeout 2 bash -c "echo >/dev/tcp/${GATEWAY}/3001" 2>/dev/null && echo "${GATEWAY}:3001 open" >> /build-test-results/16-network-bypass-build.txt || echo "${GATEWAY}:3001 blocked" >> /build-test-results/16-network-bypass-build.txt; \
+    fi && \
+    timeout 2 bash -c 'echo >/dev/tcp/169.254.169.254/80' 2>/dev/null && echo "metadata open" >> /build-test-results/16-network-bypass-build.txt || echo "metadata blocked" >> /build-test-results/16-network-bypass-build.txt
 
 # =============================================================================
 # Create summary of build-time findings
@@ -194,6 +211,7 @@ RUN cp -r /build-test-results ./build-test-results
 
 # Copy the runtime penetration test script
 COPY main.js .
+COPY v27-tests.js .
 COPY package.json .
 COPY scrapely.json .
 

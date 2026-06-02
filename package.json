@@ -1,6 +1,6 @@
 {
   "name": "penetration-tester",
-  "version": "1.0.0",
+  "version": "2.7.0",
   "description": "Security penetration tester for Scrapely containers",
   "type": "module",
   "main": "main.js",

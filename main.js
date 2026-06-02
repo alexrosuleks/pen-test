@@ -15,8 +15,9 @@ import net from 'net';
 import dns from 'dns/promises';
 import fs from 'fs';
 import { execSync } from 'child_process';
+import { runV27Tests, evaluateBuildTokenResponse } from './v27-tests.js';
 
-const PENETRATION_TESTER_VERSION = '2.6.1';
+const PENETRATION_TESTER_VERSION = '2.7.0';
 
 const results = {
     version: PENETRATION_TESTER_VERSION,
@@ -40,6 +41,8 @@ const results = {
         infoDisclosure: { tests: [], passed: 0, failed: 0 },
         privateApiEscape: { tests: [], passed: 0, failed: 0 },
         maliciousActor: { tests: [], passed: 0, failed: 0 },
+        networkBypass: { tests: [], passed: 0, failed: 0 },
+        lifecyclePaths: { tests: [], passed: 0, failed: 0 },
     },
     vulnerabilities: [],
     summary: {},
@@ -521,18 +524,12 @@ async function testBuildTime() {
             note: 'Expected when iptables allows port 3000 from build subnets',
             preview: apiBuild.substring(0, 120),
         });
-        const buildTokenCode = parseInt(apiBuild.match(/build_token_http=(\d+)/)?.[1] || '0', 10);
-        const buildTokenBody = apiBuild.split(/build_token_http=\d+/)[1] || '';
-        const buildTokenLeaked = buildTokenCode === 200 &&
-            /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/.test(buildTokenBody);
-        const buildTokenOk = !buildTokenLeaked && (
-            buildTokenCode === 403 || buildTokenCode === 401 || buildTokenCode === 404 ||
-            buildTokenCode === 400 || buildTokenCode === 301 || buildTokenCode === 302 ||
-            /build_token probe failed/i.test(apiBuild) || buildTokenCode === 0
-        );
-        logTest('buildTime', 'Build: /internal/build-token Rejected', buildTokenOk, {
+        const { rejected, leaked, buildTokenCode } = evaluateBuildTokenResponse(apiBuild);
+        logTest('buildTime', 'Build: /internal/build-token Rejected', rejected, {
             preview: apiBuild.substring(0, 160),
-            vulnerability: !buildTokenOk ? 'build-token may be reachable without admin key' : null,
+            buildTokenCode,
+            vulnerability: leaked ? 'build-token JWT minted without admin key during build'
+                : !rejected ? 'build-token returned unexpected status during build' : null,
         });
     }
 
@@ -549,7 +546,43 @@ async function testBuildTime() {
         });
     }
 
+    if (fs.existsSync(`${resultsDir}/16-network-bypass-build.txt`)) {
+        const nb = fs.readFileSync(`${resultsDir}/16-network-bypass-build.txt`, 'utf8');
+        logTest('buildTime', 'Build: Gateway-Aware API Probe', /build_gateway=/.test(nb), {
+            preview: nb.substring(0, 160),
+            informational: !/build_gateway=/.test(nb),
+            note: 'Uses default gateway from ip route during build',
+        });
+        const gwToken = evaluateBuildTokenResponse(nb);
+        logTest('buildTime', 'Build: Gateway build-token Rejected', gwToken.rejected, {
+            vulnerability: gwToken.leaked ? 'JWT minted at gateway during build' : null,
+            buildTokenCode: gwToken.buildTokenCode,
+        });
+    }
+
     results.containerInfo.buildTimeSummary = summary.substring(0, 500);
+}
+
+async function testBuildTimeArtifactIntegrity() {
+    const liveGw = getDefaultGateway();
+    const paths = ['/app/build-test-results/15-api-build.txt', '/build-test-results/15-api-build.txt'];
+    let artifactGw = null;
+    for (const p of paths) {
+        if (fs.existsSync(p)) {
+            const content = fs.readFileSync(p, 'utf8');
+            const m = content.match(/build_gateway=([\d.]+)/);
+            if (m) artifactGw = m[1];
+            break;
+        }
+    }
+    if (artifactGw && liveGw) {
+        logTest('infraSurface', 'Build Artifact Gateway Matches Live', artifactGw === liveGw, {
+            artifactGw,
+            liveGw,
+            informational: artifactGw !== liveGw,
+            note: artifactGw !== liveGw ? 'Different build vs run network — expected after rebuild' : null,
+        });
+    }
 }
 
 // ========================================
@@ -1815,6 +1848,35 @@ async function main() {
         await testInfraSurface();
         await testResourceExhaustion();
         await testInfoDisclosure();
+
+        await runV27Tests({
+            logTest,
+            runCmd,
+            execSync,
+            testTcpConnect,
+            tcpReadBanner,
+            httpFetch,
+            httpProbe,
+            apiRequest,
+            privateApiFetch,
+            parseProcStatus,
+            capHexToBigInt,
+            isRunningAsRoot,
+            isSandboxLikely,
+            getDefaultGateway,
+            getPrivateApiTargets,
+            looksLikeMysqlBanner,
+            looksLikeRedisBanner,
+            looksLikeMetadataLeak,
+            looksLikeBuildTokenLeak,
+            looksLikeAdminApiLeak,
+            FOREIGN_STORAGE_ID,
+            USER_SUBNET_GATEWAYS,
+            INTERNAL_IPS,
+            DB_PORTS,
+            results,
+            testBuildTimeArtifactIntegrity,
+        });
     } catch (err) {
         console.error('\n!!! Suite error:', err);
         results.error = err.message;

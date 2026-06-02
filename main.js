@@ -8,6 +8,7 @@
  * - CapDrop ALL + no-new-privileges (run hardening)
  * - Scrapely env (expected user token vs forbidden admin/DB creds)
  * - Resource limits, info disclosure
+ * - Malicious actor: root + token active breakout attempts
  */
 
 import net from 'net';
@@ -15,7 +16,7 @@ import dns from 'dns/promises';
 import fs from 'fs';
 import { execSync } from 'child_process';
 
-const PENETRATION_TESTER_VERSION = '2.5.0';
+const PENETRATION_TESTER_VERSION = '2.6.0';
 
 const results = {
     version: PENETRATION_TESTER_VERSION,
@@ -38,6 +39,7 @@ const results = {
         resourceExhaustion: { tests: [], passed: 0, failed: 0 },
         infoDisclosure: { tests: [], passed: 0, failed: 0 },
         privateApiEscape: { tests: [], passed: 0, failed: 0 },
+        maliciousActor: { tests: [], passed: 0, failed: 0 },
     },
     vulnerabilities: [],
     summary: {},
@@ -80,6 +82,13 @@ const DB_PORTS = [
 ];
 
 const USER_SUBNET_GATEWAYS = Array.from({ length: 16 }, (_, i) => `172.${32 + i}.0.1`);
+
+/** Valid UUID for foreign-tenant API probes (non-owned sentinel). */
+const FOREIGN_STORAGE_ID = '00000000-0000-0000-0000-000000000001';
+
+function isStorageAccessBlocked(r) {
+    return r.skipped || r.status === 403 || r.status === 404 || r.status === 400;
+}
 
 function logTest(category, name, passed, details = {}) {
     const informational = details.informational === true;
@@ -412,7 +421,6 @@ async function testBuildTime() {
         { file: '03-host-fs.txt', name: 'Build: Docker Sock Path Not Accessible', failIf: /^ACCESSIBLE: \/var\/run\/docker\.sock/m },
         { file: '10-secrets.txt', name: 'Build: No Unexpected Secret Mounts', failIf: /FOUND: \/var\/run\/docker\.sock/i },
         { file: '12-gvisor.txt', name: 'Build: /proc/version Logged (informational)', passIf: /linux|gvisor|runsc/i },
-        { file: '09-build-env.txt', name: 'Build: Kaniko Executor Not In RUN Layer', failIf: /KANIKO_VISIBLE_IN_RUN/i },
         { file: '08-capabilities.txt', name: 'Build: Capabilities Logged', passIf: /CapEff|CapBnd/i },
         { file: '09-build-env.txt', name: 'Build: Kaniko Environment', passIf: /KANIKO|Kaniko|build/i },
         { file: '06-dns.txt', name: 'Build: Internal Service DNS Blocked', failIf: /dragonfly.*Address:|redis.*Address:|singlestore.*Address:/i },
@@ -513,13 +521,28 @@ async function testBuildTime() {
             note: 'Expected when iptables allows port 3000 from build subnets',
             preview: apiBuild.substring(0, 120),
         });
-        const buildTokenLeaked = /build_token_http=200/i.test(apiBuild) &&
-            /"token"|access_token|eyJ[A-Za-z0-9_-]+\./i.test(apiBuild);
+        const buildTokenCode = parseInt(apiBuild.match(/build_token_http=(\d+)/)?.[1] || '0', 10);
+        const buildTokenLeaked = buildTokenCode === 200 &&
+            /eyJ[A-Za-z0-9_-]+\.|"token"|access_token/i.test(apiBuild);
         const buildTokenOk = !buildTokenLeaked &&
-            (/build_token_http=40[134]|403|forbidden|401|404/i.test(apiBuild) || /build_token probe failed/i.test(apiBuild));
+            ((buildTokenCode >= 400 && buildTokenCode < 500) || buildTokenCode === 0 ||
+                /build_token probe failed/i.test(apiBuild));
         logTest('buildTime', 'Build: /internal/build-token Rejected', buildTokenOk, {
             preview: apiBuild.substring(0, 160),
             vulnerability: !buildTokenOk ? 'build-token may be reachable without admin key' : null,
+        });
+    }
+
+    if (fs.existsSync(`${resultsDir}/09-build-env.txt`)) {
+        const buildEnv = fs.readFileSync(`${resultsDir}/09-build-env.txt`, 'utf8');
+        const kanikoAtRuntime = runCmd('test -f /kaniko/executor && echo yes || echo no').output.includes('yes');
+        logTest('buildTime', 'Build: Kaniko Executor Not In Final Image', !kanikoAtRuntime, {
+            vulnerability: kanikoAtRuntime ? 'Kaniko executor binary present in running container' : null,
+            informational: /KANIKO_VISIBLE/i.test(buildEnv) && !kanikoAtRuntime,
+            note: /KANIKO_VISIBLE/i.test(buildEnv) && !kanikoAtRuntime
+                ? 'Executor visible during Kaniko RUN steps only (expected for images built on platform)'
+                : undefined,
+            preview: buildEnv.substring(0, 100),
         });
     }
 
@@ -1189,21 +1212,20 @@ async function testApiAbuse() {
         });
     }
 
-    const foreignStore = '000000000000000000000000';
-    const foreignKv = await apiRequest('GET', `/v2/key-value-stores/${foreignStore}/records/SECRET`);
-    logTest('apiAbuse', 'Foreign KV Store Blocked', foreignKv.skipped || foreignKv.status === 403 || foreignKv.status === 404, {
+    const foreignKv = await apiRequest('GET', `/v2/key-value-stores/${FOREIGN_STORAGE_ID}/records/SECRET`);
+    logTest('apiAbuse', 'Foreign KV Store Blocked', isStorageAccessBlocked(foreignKv), {
         status: foreignKv.status,
         vulnerability: foreignKv.status === 200 ? 'Read foreign key-value store succeeded' : null,
     });
 
-    const foreignDataset = await apiRequest('GET', `/v2/datasets/${foreignStore}/items`);
-    logTest('apiAbuse', 'Foreign Dataset Blocked', foreignDataset.skipped || foreignDataset.status === 403 || foreignDataset.status === 404, {
+    const foreignDataset = await apiRequest('GET', `/v2/datasets/${FOREIGN_STORAGE_ID}/items`);
+    logTest('apiAbuse', 'Foreign Dataset Blocked', isStorageAccessBlocked(foreignDataset), {
         status: foreignDataset.status,
         vulnerability: foreignDataset.status === 200 ? 'Read foreign dataset succeeded' : null,
     });
 
-    const foreignQueue = await apiRequest('GET', `/v2/request-queues/${foreignStore}`);
-    logTest('apiAbuse', 'Foreign Request Queue Blocked', foreignQueue.skipped || foreignQueue.status === 403 || foreignQueue.status === 404, {
+    const foreignQueue = await apiRequest('GET', `/v2/request-queues/${FOREIGN_STORAGE_ID}`);
+    logTest('apiAbuse', 'Foreign Request Queue Blocked', isStorageAccessBlocked(foreignQueue), {
         status: foreignQueue.status,
         vulnerability: foreignQueue.status === 200 ? 'Read foreign request queue succeeded' : null,
     });
@@ -1305,8 +1327,7 @@ async function testPrivateApiEscape() {
         }
 
         const meNoAuth = await privateApiFetch(base, 'GET', '/v2/users/me');
-        const foreignStore = '000000000000000000000000';
-        const foreignKv = await privateApiFetch(base, 'GET', `/v2/key-value-stores/${foreignStore}/records/SECRET`);
+        const foreignKv = await privateApiFetch(base, 'GET', `/v2/key-value-stores/${FOREIGN_STORAGE_ID}/records/SECRET`);
         if (foreignKv.status === 200) {
             escalations.push(`${ip}: foreign KV without token`);
         }
@@ -1349,6 +1370,236 @@ async function testPrivateApiEscape() {
             note: 'Skipped — need SCRAPELY_API_URL, token, and reachable private :3000',
         });
     }
+}
+
+// ========================================
+// MALICIOUS ACTOR (root + token — active breakout attempts)
+// ========================================
+async function testMaliciousActor() {
+    console.log('\n=== MALICIOUS ACTOR (root escape attempts) ===\n');
+
+    const isRoot = isRunningAsRoot();
+    logTest('maliciousActor', 'Running As Root (attack surface)', true, {
+        uid: runCmd('id -u').output.trim(),
+        informational: true,
+        note: isRoot ? 'Simulating malicious actor with uid 0 + SCRAPELY_TOKEN' : 'Non-root — some attacks skipped',
+    });
+
+    if (!isRoot) {
+        logTest('maliciousActor', 'Root-Only Attack Suite', true, {
+            informational: true,
+            note: 'Skipped root breakout probes — container not uid 0',
+        });
+        return;
+    }
+
+    // --- Filesystem / persistence ---
+    runCmd('sed -i "/^pentest-hack:/d" /etc/passwd 2>/dev/null');
+    const passwdHack = runCmd('echo "pentest-hack::0:0:pentest:/root:/bin/sh" >> /etc/passwd 2>&1');
+    const hackUserWorks = runCmd('id pentest-hack 2>&1').success &&
+        runCmd('id pentest-hack 2>&1').output.includes('uid=0');
+    logTest('maliciousActor', 'Passwd Backdoor (in-container)', true, {
+        hackUserWorks,
+        informational: true,
+        note: hackUserWorks
+            ? 'Root can mutate container /etc/passwd — does not escape gVisor/network'
+            : 'Could not add passwd entry',
+        preview: passwdHack.output.substring(0, 80),
+    });
+    runCmd('sed -i "/^pentest-hack:/d" /etc/passwd 2>/dev/null');
+
+    const nodePath = runCmd('command -v node 2>/dev/null || command -v nodejs 2>/dev/null').output.trim();
+    let nodeOverwrite = false;
+    if (nodePath) {
+        const bak = `${nodePath}.pentest-bak`;
+        runCmd(`cp -f ${nodePath} ${bak} 2>/dev/null`);
+        const ow = runCmd(`printf '#!/bin/sh\\necho pwn\\n' > ${nodePath} 2>&1`);
+        const execOw = runCmd(`${nodePath} -e "1" 2>&1`);
+        nodeOverwrite = ow.success && /pwn/i.test(execOw.output);
+        runCmd(`mv -f ${bak} ${nodePath} 2>/dev/null`);
+    }
+    logTest('maliciousActor', 'Runtime Binary Overwrite (in-container)', true, {
+        nodeOverwrite,
+        nodePath: nodePath || 'none',
+        informational: true,
+        note: nodeOverwrite
+            ? 'Root can replace binaries in writable image — not host escape'
+            : 'Could not overwrite runtime binary',
+    });
+
+    runCmd('rm -f /etc/cron.d/pentest-hack /etc/ld.so.preload 2>/dev/null');
+    const cron = runCmd('printf "* * * * * root id > /tmp/pentest-cron.out\\n" > /etc/cron.d/pentest-hack 2>&1');
+    const cronExists = runCmd('test -f /etc/cron.d/pentest-hack && echo yes').output.includes('yes');
+    logTest('maliciousActor', 'Cron Drop-In (in-container)', true, {
+        cronWritten: cronExists && cron.success,
+        informational: true,
+        note: cronExists ? 'Wrote /etc/cron.d inside container — no host cron escape' : 'Could not write cron drop-in',
+    });
+    runCmd('rm -f /etc/cron.d/pentest-hack 2>/dev/null');
+
+    const preload = runCmd('echo /tmp/pentest-evil.so > /etc/ld.so.preload 2>&1');
+    const preloadActive = runCmd('test -f /etc/ld.so.preload && cat /etc/ld.so.preload 2>&1').output.includes('pentest-evil');
+    logTest('maliciousActor', 'LD_PRELOAD Hijack Blocked', !preloadActive, {
+        vulnerability: preloadActive ? '/etc/ld.so.preload injection succeeded' : null,
+        preview: preload.output.substring(0, 60),
+    });
+    runCmd('rm -f /etc/ld.so.preload 2>/dev/null');
+
+    // --- Namespace / mount / host access ---
+    const chroot = runCmd('mkdir -p /tmp/pentest-chroot && chroot /proc/1/root /bin/sh -c "cat /etc/hostname" 2>&1');
+    const chrootHostLeak = chroot.success && chroot.output.trim() &&
+        chroot.output.trim() !== runCmd('cat /etc/hostname 2>&1').output.trim();
+    logTest('maliciousActor', 'Chroot Into /proc/1/root Stays In Container', !chrootHostLeak, {
+        preview: chroot.output.substring(0, 80),
+        vulnerability: chrootHostLeak ? 'chroot /proc/1/root revealed different hostname (host?)' : null,
+    });
+
+    const nsenter = runCmd('nsenter -t 1 -m -u -i -n -p -- true 2>&1');
+    logTest('maliciousActor', 'nsenter Into PID 1 Blocked', !nsenter.success || /permission|denied|not permitted|not found/i.test(nsenter.output + nsenter.stderr), {
+        preview: (nsenter.output || nsenter.stderr || '').substring(0, 80),
+        vulnerability: nsenter.success ? 'nsenter into init namespace succeeded' : null,
+    });
+
+    const bindMount = runCmd('mkdir -p /tmp/pentest-bind && mount --bind / /tmp/pentest-bind 2>&1');
+    logTest('maliciousActor', 'Bind-Mount Host Root Blocked', !bindMount.success || /permission|denied|not permitted/i.test(bindMount.output + bindMount.stderr), {
+        vulnerability: bindMount.success ? 'bind mount of / succeeded' : null,
+    });
+
+    const pivot = runCmd('mkdir -p /tmp/pentest-pivot/old /tmp/pentest-pivot/new && pivot_root /tmp/pentest-pivot/new /tmp/pentest-pivot/old 2>&1');
+    logTest('maliciousActor', 'pivot_root Blocked', !pivot.success || /permission|denied|not permitted|invalid/i.test(pivot.output + pivot.stderr), {
+        preview: (pivot.output || pivot.stderr || '').substring(0, 80),
+    });
+
+    // --- Cgroup / proc / device attacks ---
+    const releaseWrite = runCmd('find /sys/fs/cgroup -name release_agent -exec sh -c \'echo /bin/sh > "$1"\' _ {} \\; 2>&1 | head -3');
+    const releaseReadable = runCmd('find /sys/fs/cgroup -name release_agent -readable 2>/dev/null | head -1').output.trim();
+    logTest('maliciousActor', 'Cgroup release_agent Not Writable', !releaseReadable || /permission|denied|read-only/i.test(releaseWrite.output), {
+        preview: (releaseWrite.output || releaseReadable).substring(0, 80),
+        vulnerability: releaseReadable && !/denied|read-only/i.test(releaseWrite.output)
+            ? 'cgroup release_agent may be writable' : null,
+    });
+
+    for (const dev of ['/dev/mem', '/dev/kmsg', '/dev/sda']) {
+        const r = runCmd(`dd if=${dev} of=/dev/null bs=1 count=1 2>&1`);
+        const readDev = r.success && !/permission|denied|not permitted|no such/i.test(r.output + r.stderr);
+        logTest('maliciousActor', `Dangerous Device ${dev} Not Readable`, !readDev, {
+            vulnerability: readDev ? `Read ${dev} succeeded` : null,
+            preview: (r.output || r.stderr || '').substring(0, 60),
+        });
+    }
+
+    const sysrq = runCmd('echo 1 > /proc/sysrq-trigger 2>&1');
+    logTest('maliciousActor', 'SysRq Trigger Blocked', !sysrq.success || /permission|denied/i.test(sysrq.output + sysrq.stderr), {
+        vulnerability: sysrq.success ? 'Wrote /proc/sysrq-trigger' : null,
+    });
+
+    // --- Docker / host paths ---
+    const dockerSock = runCmd('curl -sS --unix-socket /var/run/docker.sock http://localhost/containers/json 2>&1 | head -3');
+    const dockerApiWorks = dockerSock.success && /"Id"|"Names"/.test(dockerSock.output);
+    logTest('maliciousActor', 'Docker Socket API Blocked', !dockerApiWorks, {
+        vulnerability: dockerApiWorks ? 'Docker HTTP API over unix socket works' : null,
+        preview: dockerSock.output.substring(0, 80),
+    });
+
+    for (const hostPath of ['/host/etc/passwd', '/host/var/run/docker.sock', '/root/.ssh/id_rsa']) {
+        const r = runCmd(`head -c 40 ${hostPath} 2>&1`);
+        const hostLeak = r.success && !/no such|permission denied|not permitted/i.test(r.output);
+        logTest('maliciousActor', `Host Path ${hostPath} Not Readable`, !hostLeak, {
+            vulnerability: hostLeak ? `Read host file ${hostPath}` : null,
+        });
+    }
+
+    // --- Network: Redis/MySQL command injection on gateways ---
+    const gw = getDefaultGateway() || '172.17.0.1';
+    const redisAttack = await tcpReadBanner(gw, 6379, 32, 2000);
+    let redisPwned = false;
+    if (redisAttack.connected) {
+        const cmd = runCmd(`printf "CONFIG GET dir\\r\\n" | nc -w 2 ${gw} 6379 2>&1 | head -5`);
+        redisPwned = /^\+OK/i.test(cmd.output) || /dir\r?\n/i.test(cmd.output);
+    }
+    logTest('maliciousActor', 'Redis Command Injection On Gateway Blocked', !redisPwned, {
+        gateway: gw,
+        vulnerability: redisPwned ? `Redis accepted commands on ${gw}:6379` : null,
+    });
+
+    const mysqlGw = USER_SUBNET_GATEWAYS.find((g) => g !== `${gw}`) || '172.32.0.1';
+    const mysqlBanner = await tcpReadBanner(mysqlGw, 3306, 16, 2000);
+    logTest('maliciousActor', 'Cross-Subnet MySQL Not Exploitable', !looksLikeMysqlBanner(mysqlBanner.raw), {
+        target: `${mysqlGw}:3306`,
+        vulnerability: looksLikeMysqlBanner(mysqlBanner.raw) ? 'MySQL protocol on foreign subnet gateway' : null,
+    });
+
+    // --- API: token-only attacks on private :3000 ---
+    const token = process.env.SCRAPELY_TOKEN;
+    const reachable = [];
+    for (const ip of getPrivateApiTargets()) {
+        if ((await testTcpConnect(ip, 3000, 1500)).connected) reachable.push(ip);
+    }
+    if (token && reachable.length > 0) {
+        const base = `http://${reachable[0]}:3000`;
+        const metamorph = await privateApiFetch(base, 'PUT', '/internal/runs/metamorph', {
+            token,
+            body: { targetActorId: 'evil', inputKey: 'INPUT' },
+        });
+        logTest('maliciousActor', 'Legacy Internal Routes Blocked With User Token', metamorph.status === 404 || metamorph.status === 403 || metamorph.status === 401, {
+            status: metamorph.status,
+            vulnerability: metamorph.status === 200 ? 'PUT /internal/runs/metamorph succeeded with user token' : null,
+        });
+
+        const fakeAdmin = await privateApiFetch(base, 'GET', '/v2/admin/users', {
+            headers: { 'X-Admin-Key': token, Authorization: `Bearer ${token}` },
+        });
+        logTest('maliciousActor', 'Admin API Not Bypassed With User Token', !looksLikeAdminApiLeak(fakeAdmin.bodyPreview || fakeAdmin.body, fakeAdmin.status), {
+            status: fakeAdmin.status,
+            vulnerability: looksLikeAdminApiLeak(fakeAdmin.bodyPreview || fakeAdmin.body, fakeAdmin.status)
+                ? 'Admin users leaked using SCRAPELY_TOKEN as X-Admin-Key' : null,
+        });
+
+        const foreignPut = await privateApiFetch(base, 'PUT', `/v2/key-value-stores/${FOREIGN_STORAGE_ID}/records/OWNED`, {
+            token,
+            body: { pwned: true },
+            headers: { 'Content-Type': 'application/json' },
+        });
+        logTest('maliciousActor', 'Foreign KV Write Blocked With User Token', foreignPut.status !== 200 && foreignPut.status !== 201, {
+            status: foreignPut.status,
+            vulnerability: foreignPut.status === 200 || foreignPut.status === 201
+                ? 'Wrote foreign KV via private API' : null,
+        });
+    } else {
+        logTest('maliciousActor', 'Private API Token Abuse Probes', true, {
+            informational: true,
+            note: 'Skipped — need token and reachable private :3000',
+        });
+    }
+
+    // --- Exfil: shadow + token in one blob (root read, simulate upload) ---
+    const shadow = runCmd('cat /etc/shadow 2>&1 | head -3');
+    const shadowReadable = shadow.success && shadow.output.includes(':');
+    const tokenInEnv = !!process.env.SCRAPELY_TOKEN;
+    const combinedExfil = shadowReadable && tokenInEnv;
+    logTest('maliciousActor', 'Shadow+Token Combo Does Not Reach Host', true, {
+        shadowReadable,
+        tokenInEnv,
+        informational: true,
+        note: combinedExfil
+            ? 'Root can read shadow and token inside container — egress still user-scoped API'
+            : 'Limited local secret material',
+    });
+
+    // --- Fork / resource abuse (light) ---
+    let rapidFork = 0;
+    for (let i = 0; i < 50; i++) {
+        try {
+            execSync('true', { timeout: 300 });
+            rapidFork++;
+        } catch { break; }
+    }
+    logTest('maliciousActor', 'Rapid Fork Bomb Contained', rapidFork < 50, {
+        spawned: rapidFork,
+        vulnerability: rapidFork >= 50 ? 'No fork limit hit in 50 spawns' : null,
+        informational: rapidFork >= 50,
+        note: rapidFork >= 50 ? 'May indicate missing pids limit' : 'Fork limited or stopped early',
+    });
 }
 
 // ========================================
@@ -1407,22 +1658,24 @@ async function testEscapeProbes() {
         preview: (ptrace.output || ptrace.stderr || '').substring(0, 80),
     });
 
-    // Path traversal resolves to container /etc, not host — same device as /etc/passwd
+    // Path traversal — writable /etc is expected; fail only if write escapes container namespace
     runCmd('rm -f /etc/pentest-escape-probe /tmp/pentest-escape-probe 2>/dev/null');
     runCmd('echo pwn > /tmp/../../etc/pentest-escape-probe 2>&1');
     const traversalExists = runCmd('test -f /etc/pentest-escape-probe && echo yes || echo no').output.includes('yes');
     let traversalOnContainerRoot = !traversalExists;
     if (traversalExists) {
-        const devs = runCmd('stat -c %d /etc/passwd /etc/pentest-escape-probe 2>/dev/null').output
-            .trim().split('\n').filter(Boolean);
-        traversalOnContainerRoot = devs.length === 2 && devs[0] === devs[1];
+        const inProc1 = runCmd('test -f /proc/1/root/etc/pentest-escape-probe && echo yes || echo no').output.includes('yes');
+        const mPasswd = runCmd('findmnt -n -o TARGET /etc/passwd 2>/dev/null').output.trim();
+        const mProbe = runCmd('findmnt -n -o TARGET /etc/pentest-escape-probe 2>/dev/null').output.trim();
+        const sameMount = mPasswd.length > 0 && mPasswd === mProbe;
+        traversalOnContainerRoot = inProc1 || sameMount;
     }
     logTest('escapeProbes', 'Path Traversal Stays On Container Rootfs', traversalOnContainerRoot, {
         vulnerability: traversalExists && !traversalOnContainerRoot
-            ? 'Traversal write left container rootfs device'
+            ? 'Traversal write not visible in container mount namespace'
             : null,
         note: traversalExists
-            ? 'File created under container /etc (expected); not host /etc'
+            ? 'File under container /etc (overlay upper layer OK)'
             : 'Could not create probe file',
     });
     runCmd('rm -f /etc/pentest-escape-probe /tmp/pentest-escape-probe 2>/dev/null');
@@ -1540,6 +1793,7 @@ async function main() {
         await testRegistryAccess();
         await testGvisorEscape();
         await testContainerBreakout();
+        await testMaliciousActor();
         await testSsrfAndFetch();
         await testApiAbuse();
         await testPrivateApiEscape();

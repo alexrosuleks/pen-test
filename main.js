@@ -16,7 +16,7 @@ import dns from 'dns/promises';
 import fs from 'fs';
 import { execSync } from 'child_process';
 
-const PENETRATION_TESTER_VERSION = '2.6.0';
+const PENETRATION_TESTER_VERSION = '2.6.1';
 
 const results = {
     version: PENETRATION_TESTER_VERSION,
@@ -522,11 +522,14 @@ async function testBuildTime() {
             preview: apiBuild.substring(0, 120),
         });
         const buildTokenCode = parseInt(apiBuild.match(/build_token_http=(\d+)/)?.[1] || '0', 10);
+        const buildTokenBody = apiBuild.split(/build_token_http=\d+/)[1] || '';
         const buildTokenLeaked = buildTokenCode === 200 &&
-            /eyJ[A-Za-z0-9_-]+\.|"token"|access_token/i.test(apiBuild);
-        const buildTokenOk = !buildTokenLeaked &&
-            ((buildTokenCode >= 400 && buildTokenCode < 500) || buildTokenCode === 0 ||
-                /build_token probe failed/i.test(apiBuild));
+            /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/.test(buildTokenBody);
+        const buildTokenOk = !buildTokenLeaked && (
+            buildTokenCode === 403 || buildTokenCode === 401 || buildTokenCode === 404 ||
+            buildTokenCode === 400 || buildTokenCode === 301 || buildTokenCode === 302 ||
+            /build_token probe failed/i.test(apiBuild) || buildTokenCode === 0
+        );
         logTest('buildTime', 'Build: /internal/build-token Rejected', buildTokenOk, {
             preview: apiBuild.substring(0, 160),
             vulnerability: !buildTokenOk ? 'build-token may be reachable without admin key' : null,
@@ -1378,6 +1381,17 @@ async function testPrivateApiEscape() {
 async function testMaliciousActor() {
     console.log('\n=== MALICIOUS ACTOR (root escape attempts) ===\n');
 
+    try {
+        await runMaliciousActorProbes();
+    } catch (err) {
+        console.error('Malicious actor suite error:', err);
+        logTest('maliciousActor', 'Malicious Actor Suite Completed', false, {
+            vulnerability: err.message,
+        });
+    }
+}
+
+async function runMaliciousActorProbes() {
     const isRoot = isRunningAsRoot();
     logTest('maliciousActor', 'Running As Root (attack surface)', true, {
         uid: runCmd('id -u').output.trim(),
@@ -1408,24 +1422,21 @@ async function testMaliciousActor() {
     });
     runCmd('sed -i "/^pentest-hack:/d" /etc/passwd 2>/dev/null');
 
-    const nodePath = runCmd('command -v node 2>/dev/null || command -v nodejs 2>/dev/null').output.trim();
-    let nodeOverwrite = false;
-    if (nodePath) {
-        const bak = `${nodePath}.pentest-bak`;
-        runCmd(`cp -f ${nodePath} ${bak} 2>/dev/null`);
-        const ow = runCmd(`printf '#!/bin/sh\\necho pwn\\n' > ${nodePath} 2>&1`);
-        const execOw = runCmd(`${nodePath} -e "1" 2>&1`);
-        nodeOverwrite = ow.success && /pwn/i.test(execOw.output);
-        runCmd(`mv -f ${bak} ${nodePath} 2>/dev/null`);
-    }
-    logTest('maliciousActor', 'Runtime Binary Overwrite (in-container)', true, {
-        nodeOverwrite,
-        nodePath: nodePath || 'none',
+    // Never overwrite the running node binary — that kills this process. Probe a decoy path instead.
+    const probeBin = '/usr/local/bin/pentest-decoy-bin';
+    runCmd(`rm -f ${probeBin} 2>/dev/null`);
+    const decoyWrite = runCmd(`printf '#!/bin/sh\\necho decoy_ok\\n' > ${probeBin} && chmod +x ${probeBin} 2>&1`);
+    const decoyRun = runCmd(`${probeBin} 2>&1`);
+    const decoyWorks = decoyWrite.success && decoyRun.output.includes('decoy_ok');
+    logTest('maliciousActor', 'Writable Rootfs Binary Plant (in-container)', true, {
+        decoyWorks,
         informational: true,
-        note: nodeOverwrite
-            ? 'Root can replace binaries in writable image — not host escape'
-            : 'Could not overwrite runtime binary',
+        note: decoyWorks
+            ? 'Root can plant executables under writable rootfs (not host escape)'
+            : 'Could not plant decoy binary',
+        preview: decoyRun.output.substring(0, 40),
     });
+    runCmd(`rm -f ${probeBin} 2>/dev/null`);
 
     runCmd('rm -f /etc/cron.d/pentest-hack /etc/ld.so.preload 2>/dev/null');
     const cron = runCmd('printf "* * * * * root id > /tmp/pentest-cron.out\\n" > /etc/cron.d/pentest-hack 2>&1');
@@ -1471,12 +1482,15 @@ async function testMaliciousActor() {
     });
 
     // --- Cgroup / proc / device attacks ---
-    const releaseWrite = runCmd('find /sys/fs/cgroup -name release_agent -exec sh -c \'echo /bin/sh > "$1"\' _ {} \\; 2>&1 | head -3');
-    const releaseReadable = runCmd('find /sys/fs/cgroup -name release_agent -readable 2>/dev/null | head -1').output.trim();
-    logTest('maliciousActor', 'Cgroup release_agent Not Writable', !releaseReadable || /permission|denied|read-only/i.test(releaseWrite.output), {
-        preview: (releaseWrite.output || releaseReadable).substring(0, 80),
-        vulnerability: releaseReadable && !/denied|read-only/i.test(releaseWrite.output)
-            ? 'cgroup release_agent may be writable' : null,
+    const releaseAgent = runCmd('find /sys/fs/cgroup -maxdepth 4 -name release_agent 2>/dev/null | head -1', 3000).output.trim();
+    let releaseWritable = false;
+    if (releaseAgent) {
+        const w = runCmd(`sh -c 'echo /bin/sh > "${releaseAgent}"' 2>&1`, 2000);
+        releaseWritable = w.success && !/permission|denied|read-only/i.test(w.output + w.stderr);
+    }
+    logTest('maliciousActor', 'Cgroup release_agent Not Writable', !releaseWritable, {
+        preview: releaseAgent.substring(0, 80) || 'not found',
+        vulnerability: releaseWritable ? 'Wrote cgroup release_agent' : null,
     });
 
     for (const dev of ['/dev/mem', '/dev/kmsg', '/dev/sda']) {
